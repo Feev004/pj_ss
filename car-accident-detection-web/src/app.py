@@ -5,7 +5,7 @@ from ultralytics import YOLO
 
 app = Flask(__name__)
 
-model_path = os.path.join(os.path.dirname(__file__), "model", "best.pt")
+model_path = os.path.join(os.path.dirname(__file__), "model", "best.pt") #<-- เปลี่ยนเส้นทางโมเดลตามที่คุณต้องการ
 model = YOLO(model_path)
 names = model.model.names
 
