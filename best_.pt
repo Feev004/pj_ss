@@ -1,0 +1,3 @@
+The file `src/model/best.pt` is a binary file that contains the trained machine learning model. As such, it cannot be represented as text content. You would typically generate this file by training a model using a machine learning framework like PyTorch and saving it using the `torch.save()` function.
+
+If you need to create or modify this file, you would do so in your model training script, not directly in the file itself. Therefore, this file is intentionally left blank as it is meant to be populated with the model data.

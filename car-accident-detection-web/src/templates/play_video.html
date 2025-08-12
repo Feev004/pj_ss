@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Play Video</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        margin-top: 20px;
+      }
+      #video-container {
+        margin-bottom: 20px;
+        border: 1px solid #ccc;
+        box-shadow: 2px 2px 10px #aaa;
+      }
+      #detected-objects {
+        margin-top: 20px;
+        width: 80%;
+        text-align: center;
+      }
+      #detected-objects h2 {
+        color: #333;
+      }
+      #objects-list {
+        list-style: none;
+        padding: 0;
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 10px;
+      }
+      #detected-objects li {
+        display: inline-block;
+        margin: 5px 10px;
+        padding: 5px 10px;
+        background: #eee;
+        border-radius: 5px;
+      }
+      #accident-list {
+        list-style: none;
+        padding: 0;
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 20px;
+      }
+      #accident-list li {
+        width: 220px;
+        margin-bottom: 20px;
+        flex: 0 0 calc(20% - 20px); /* 5 รูปต่อแถว */
+        text-align: center;
+        background: #f9f9f9;
+        border-radius: 8px;
+        box-shadow: 1px 1px 6px #ddd;
+        padding: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Video with Object Detection</h1>
+    <div id="video-container">
+      <img
+        id="video-feed"
+        src="{{ url_for('video_feed', filename=filename) }}"
+        width="1020"
+        height="600"
+      />
+    </div>
+    <p><a href="{{ url_for('index') }}">Upload another video</a></p>
+
+    <div id="detected-objects">
+      <h2>Detected Objects:</h2>
+      <ul id="objects-list">
+        <li>Loading...</li>
+      </ul>
+    </div>
+    <div id="accident-log">
+      <h2>Accident Log</h2>
+      <ul id="accident-list"></ul>
+    </div>
+
+    <script>
+      const filename = "{{ filename }}";
+      let detectedObjectsInterval = setInterval(updateDetectedObjects, 2000);
+      let accidentLogInterval = setInterval(updateAccidentLog, 2000);
+
+      function updateDetectedObjects() {
+        fetch(`/detected_objects/${filename}`)
+          .then((response) => response.json())
+          .then((data) => {
+            const ul = document.getElementById("objects-list");
+            ul.innerHTML = "";
+            if (data === "done") {
+              ul.innerHTML = "<li>Video ended.</li>";
+              clearInterval(detectedObjectsInterval);
+              clearInterval(accidentLogInterval);
+            } else if (data.length > 0) {
+              data.forEach((obj) => {
+                const li = document.createElement("li");
+                li.textContent = obj;
+                ul.appendChild(li);
+              });
+            } else {
+              ul.innerHTML = "<li>No objects detected yet.</li>";
+            }
+          });
+      }
+      updateDetectedObjects();
+
+      function updateAccidentLog() {
+        fetch(`/accident_log/${filename}`)
+          .then((response) => response.json())
+          .then((data) => {
+            const ul = document.getElementById("accident-list");
+            ul.innerHTML = "";
+            if (data === "done") {
+              ul.innerHTML = "<li>Video ended.</li>";
+              clearInterval(accidentLogInterval);
+              clearInterval(detectedObjectsInterval);
+            } else if (data.length > 0) {
+              data.forEach((item) => {
+                const li = document.createElement("li");
+                li.innerHTML = `
+    <div>
+        <span>Time: ${item.time} sec</span><br>
+        <img src="/accident_frame/${filename}?frame=${item.frame}" width="300"
+                 onerror="this.style.display='none'; this.parentNode.appendChild(document.createTextNode('Image not found'));" />
+    </div>
+`;
+                ul.appendChild(li);
+              });
+            } else {
+              ul.innerHTML = "<li>No accident detected.</li>";
+            }
+          });
+      }
+      updateAccidentLog();
+    </script>
+  </body>
+</html>
