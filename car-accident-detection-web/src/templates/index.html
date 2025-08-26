@@ -1,22 +1,76 @@
-
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>YOLOv11 Detection</title>
-    </head>
-    <body>
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>YOLOv11 Detection</title>
+    <link
+      rel="stylesheet"
+      href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css"
+    />
+    <style>
+      body {
+        background: linear-gradient(135deg, #dff9fb, #c7ecee);
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family: "Segoe UI", sans-serif;
+      }
+      .card {
+        border-radius: 20px;
+        box-shadow: 0 10px 20px rgba(0, 0, 0, 0.15);
+      }
+      h1 {
+        text-align: center;
+        font-weight: bold;
+        margin-bottom: 20px;
+      }
+      .btn-custom {
+        padding: 8px 40px; /* 8px = บน-ล่าง , 40px = ซ้าย-ขวา */
+        border-radius: 999px;
+        font-size: 16px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin: 10px auto; /* จัดปุ่มให้อยู่ตรงกลาง */
+      }
+      .form-label {
+        font-weight: 500;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card p-4">
         <h1>YOLOv11 Object Detection</h1>
-        <form action="/upload" method="post" enctype="multipart/form-data">
-            <p>Upload video file:</p>
-            <input type="file" name="file">
-            <input type="submit" value="Upload">
+
+        <!-- Upload Section -->
+        <form
+          action="/upload"
+          method="post"
+          enctype="multipart/form-data"
+          class="mb-4"
+        >
+          <div class="mb-3">
+            <label class="form-label">Upload video file:</label>
+            <input type="file" class="form-control" name="file" required />
+          </div>
+          <button type="submit" class="btn btn-primary btn-custom w-100">
+            Upload & Detect
+          </button>
         </form>
-        <br>
-        <form action="/link" method="post">
-            <p>Video URL:</p>
-            <input type="text" name="url">
-            <input type="submit" value="Play from URL">
-        </form>
-    </body>
-    </html>
-    
+
+        <!-- <hr /> -->
+
+        <!-- URL Section -->
+        <!-- <form action="/link" method="post">
+                <div class="mb-3">
+                    <label class="form-label">Video URL:</label>
+                    <input type="text" class="form-control" name="url" placeholder="Enter video link..." required>
+                </div>
+                <button type="submit" class="btn btn-success btn-custom w-100">Play from URL</button>
+            </form> -->
+      </div>
+    </div>
+  </body>
+</html>
