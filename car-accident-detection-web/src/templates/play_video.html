@@ -107,8 +107,8 @@
 
     <script>
       const filename = "{{ filename }}";
-      let detectedObjectsInterval = setInterval(updateDetectedObjects, 100);
-      let accidentLogInterval = setInterval(updateAccidentLog, 100);
+      let detectedObjectsInterval = setInterval(updateDetectedObjects, 1000);
+      let accidentLogInterval = setInterval(updateAccidentLog, 1000);
 
       function updateDetectedObjects() {
         fetch(`/detected_objects/${filename}`)
