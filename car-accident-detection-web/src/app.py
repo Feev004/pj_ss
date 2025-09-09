@@ -100,23 +100,28 @@ def detect_objects_from_video(video_path, filename):
             boxes = results[0].boxes.xyxy.int().cpu().tolist()
             class_ids = results[0].boxes.cls.int().cpu().tolist()
             track_ids = results[0].boxes.id.int().cpu().tolist()
-
-            for box, class_id, track_id in zip(boxes, class_ids, track_ids):
+            for box, class_id, track_id, conf in zip(boxes, class_ids, track_ids, results[0].boxes.conf.cpu().tolist()):
                 c = names[class_id]
-                detected_objects.append(c)
                 x1, y1, x2, y2 = box
-                color = (0, 0, 255) if c == "accident" else (0, 255, 0)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, f'{track_id} - {c}', (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                # ถ้าเจอ accident ให้บันทึก log
-                if c == "accident":
+                if c == "accident" and conf >= 0.7:  # ปรับ threshold ได้ตามต้องการ
+                    detected_objects.append(c)
+                    color = (0, 0, 255)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, f'{track_id} - {c} ({conf:.2f})', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    # บันทึก log เฉพาะ accident ที่มั่นใจ
                     sec = int(count / fps)
                     accident_log.append({
                         "frame": count,
                         "time": sec,
-                        "box": [x1, y1, x2, y2]
-                        })
+                        "box": [x1, y1, x2, y2],
+                        "confidence": conf
+                    })
+                    print("accident detected!", accident_log)
+                elif c != "accident":
+                    detected_objects.append(c)
+                    color = (0, 255, 0)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, f'{track_id} - {c} ({conf:.2f})', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                     print("accident detected!", accident_log)
 
         detected_objects_by_file[filename] = detected_objects

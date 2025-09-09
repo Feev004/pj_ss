@@ -148,10 +148,10 @@
                 const li = document.createElement("li");
                 li.innerHTML = `
                   <div>
-                      <span class="badge badge-danger mb-2">Time: ${item.time} sec</span><br>
-                      <img src="/accident_frame/${filename}?frame=${item.frame}" 
-                           onerror="this.style.display='none'; this.parentNode.appendChild(document.createTextNode('Image not found'));" />
-                  </div>
+                    <span>Time: ${item.time} sec</span><br>
+                    <span>Confidence: ${(item.confidence * 100).toFixed(2)}%</span><br>
+                    <img src="/accident_frame/${filename}?frame=${item.frame}" width="300" onerror="this.style.display='none'; this.parentNode.appendChild(document.createTextNode('Image not found'));" />
+                    </div>
                 `;
                 ul.appendChild(li);
               });
