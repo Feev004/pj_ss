@@ -117,6 +117,9 @@ def detect_objects_from_video(video_path, filename):
                         "confidence": conf
                     })
                     print("accident detected!", accident_log)
+                elif c == "non-accident":
+                    #ไม่แสดง non-accident
+                    continue
                 elif c != "accident":
                     detected_objects.append(c)
                     color = (0, 255, 0)
