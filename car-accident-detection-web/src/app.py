@@ -2,6 +2,7 @@ import os
 import cv2
 from flask import Flask, render_template, Response, request, redirect, url_for, send_from_directory, jsonify
 from ultralytics import YOLO
+from flask import send_file
 
 app = Flask(__name__)
 
@@ -79,6 +80,9 @@ def get_detected_objects(filename):
 
 accident_log_by_file = {}  # เพิ่มตัวแปรเก็บ log
 
+ACCIDENT_FRAME_DIR = "accident_frames"
+os.makedirs(ACCIDENT_FRAME_DIR, exist_ok=True)
+
 def detect_objects_from_video(video_path, filename):
     cap = cv2.VideoCapture(video_path)
     count = 0
@@ -103,24 +107,30 @@ def detect_objects_from_video(video_path, filename):
             for box, class_id, track_id, conf in zip(boxes, class_ids, track_ids, results[0].boxes.conf.cpu().tolist()):
                 c = names[class_id]
                 x1, y1, x2, y2 = box
-                if c == "accident" and conf >= 0.7:  # ปรับ threshold ได้ตามต้องการ
-                    detected_objects.append(c)
-                    color = (0, 0, 255)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(frame, f'{track_id} - {c} ({conf:.2f})', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                    # บันทึก log เฉพาะ accident ที่มั่นใจ
-                    sec = int(count / fps)
-                    accident_log.append({
-                        "frame": count,
-                        "time": sec,
-                        "box": [x1, y1, x2, y2],
-                        "confidence": conf
-                    })
-                    print("accident detected!", accident_log)
+                if c == "accident" and conf >= 0.75:
+                     detected_objects.append(c)
+                     color = (0, 0, 255)
+                     # วาดกรอบก่อน
+                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                     cv2.putText(frame, f'{track_id} - {c} ({conf:.2f})', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                     # แล้วค่อยเซฟเฟรมที่วาดกรอบแล้ว
+                     frame_filename = f"{filename}_frame_{count}.jpg"
+                     frame_path = os.path.join(ACCIDENT_FRAME_DIR, frame_filename)
+                     cv2.imwrite(frame_path, frame)
+                     # บันทึก log
+                     sec = int(count / fps)
+                     accident_log.append({
+                         "frame": count,
+                         "time": sec,
+                         "box": [x1, y1, x2, y2],
+                         "confidence": conf,
+                         "img": frame_filename
+                         })
+                     print("accident detected!", accident_log)
                 elif c == "non-accident":
                     #ไม่แสดง non-accident
                     continue
-                elif c != "accident":
+                elif c != "accident" and conf >= 0.5:
                     detected_objects.append(c)
                     color = (0, 255, 0)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
@@ -159,15 +169,16 @@ def accident_log(filename):
 @app.route('/accident_frame/<filename>')
 def accident_frame(filename):
     frame_num = int(request.args.get('frame', 0))
-    video_path = os.path.join('uploads', filename)
-    cap = cv2.VideoCapture(video_path)
+    frame_filename = f"{filename}_frame_{frame_num}.jpg"
+    frame_path = os.path.join("accident_frames", frame_filename)
+    video_path_ = os.path.join('uploads', filename)
+    cap = cv2.VideoCapture(video_path_)
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
     ret, frame = cap.read()
     cap.release()
-    if not ret:
+    if not os.path.exists(frame_path):
         return '', 404
-    _, buffer = cv2.imencode('.jpg', frame)
-    return Response(buffer.tobytes(), mimetype='image/jpeg')
+    return send_file(frame_path, mimetype='image/jpeg')
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
