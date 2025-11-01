@@ -1,14 +1,22 @@
 import os
 import cv2
-from flask import Flask, render_template, Response, request, redirect, url_for, send_from_directory, jsonify
+from flask import Flask, render_template, Response, request, redirect, url_for, send_from_directory, jsonify, send_file
 from ultralytics import YOLO
-from flask import send_file
 
 app = Flask(__name__)
 
-model_path = os.path.join(os.path.dirname(__file__), "model", "best.pt") #<-- เปลี่ยนเส้นทางโมเดลตามที่คุณต้องการ
+# ...existing code...
+model_path = os.path.join(os.path.dirname(__file__), "model", "best.pt")
 model = YOLO(model_path)
 names = model.model.names
+print("MODEL CLASS NAMES:", names)
+
+# thresholds (ปรับเพื่อทดสอบ)
+ACCIDENT_CLASS_NAME = "accident"   # เปลี่ยนถ้าชื่อคลาสใน model ต่างกัน
+ACCIDENT_CONF_THRESHOLD = 0.1
+PROCESS_EVERY_N = 1
+TRACK_CONF = 0.25   # ค่าเริ่มต้นสำหรับ model.track ตอนดีบัก -> ปรับเพิ่มเมื่อพร้อม
+TRACK_IOU = 0.45
 
 detected_objects_by_file = {}
 
@@ -16,45 +24,8 @@ detected_objects_by_file = {}
 def index():
     return render_template('index.html')
 
-@app.route('/start_webcam')
-def start_webcam():
-    return render_template('webcam.html')
-
-def detect_objects_from_webcam():
-    count = 0
-    cap = cv2.VideoCapture(0)
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        count += 1
-        if count % 2 != 0:
-            continue
-        frame = cv2.resize(frame, (1020, 600))
-        results = model.track(frame, persist=True)
-
-        if results[0].boxes is not None and results[0].boxes.id is not None:
-            boxes = results[0].boxes.xyxy.int().cpu().tolist()
-            class_ids = results[0].boxes.cls.int().cpu().tolist()
-            track_ids = results[0].boxes.id.int().cpu().tolist()
-
-            for box, class_id, track_id in zip(boxes, class_ids, track_ids):
-                c = names[class_id]
-                x1, y1, x2, y2 = box
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, f'{track_id} - {c}', (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
-
-        _, buffer = cv2.imencode('.jpg', frame)
-        frame = buffer.tobytes()
-
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-
-@app.route('/webcam_feed')
-def webcam_feed():
-    return Response(detect_objects_from_webcam(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+# ...existing code...
+# (removed webcam routes and functions)
 
 @app.route('/upload', methods=['POST'])
 def upload_video():
@@ -78,15 +49,16 @@ def get_detected_objects(filename):
     detected_objects = detected_objects_by_file.get(filename, [])
     return jsonify(detected_objects)
 
-accident_log_by_file = {}  # เพิ่มตัวแปรเก็บ log
-
+accident_log_by_file = {}
 ACCIDENT_FRAME_DIR = "accident_frames"
 os.makedirs(ACCIDENT_FRAME_DIR, exist_ok=True)
+DETECTION_FRAME_DIR = "detection_frames"
+os.makedirs(DETECTION_FRAME_DIR, exist_ok=True)
 
 def detect_objects_from_video(video_path, filename):
     cap = cv2.VideoCapture(video_path)
     count = 0
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
     accident_log = []
 
     while cap.isOpened():
@@ -94,58 +66,92 @@ def detect_objects_from_video(video_path, filename):
         if not ret:
             break
         count += 1
-        if count % 2 != 0:
+
+        # process every Nth frame (use 1 for testing)
+        if (count % PROCESS_EVERY_N) != 0:
             continue
+
+        # resize for inference / display
         frame = cv2.resize(frame, (1020, 600))
-        results = model.track(frame, persist=True)
+
+        # run tracker/detector (adjust conf/iou when tuning)
+        results = model.track(frame, persist=True, conf=TRACK_CONF, iou=TRACK_IOU)
 
         detected_objects = []
-        if results[0].boxes is not None and results[0].boxes.id is not None:
-            boxes = results[0].boxes.xyxy.int().cpu().tolist()
-            class_ids = results[0].boxes.cls.int().cpu().tolist()
-            track_ids = results[0].boxes.id.int().cpu().tolist()
-            for box, class_id, track_id, conf in zip(boxes, class_ids, track_ids, results[0].boxes.conf.cpu().tolist()):
-                c = names[class_id]
-                x1, y1, x2, y2 = box
-                if c == "accident" and conf >= 0.75:
-                     detected_objects.append(c)
-                     color = (0, 0, 255)
-                     # วาดกรอบก่อน
-                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                     cv2.putText(frame, f'{track_id} - {c} ({conf:.2f})', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                     # แล้วค่อยเซฟเฟรมที่วาดกรอบแล้ว
-                     frame_filename = f"{filename}_frame_{count}.jpg"
-                     frame_path = os.path.join(ACCIDENT_FRAME_DIR, frame_filename)
-                     cv2.imwrite(frame_path, frame)
-                     # บันทึก log
-                     sec = int(count / fps)
-                     accident_log.append({
-                         "frame": count,
-                         "time": sec,
-                         "box": [x1, y1, x2, y2],
-                         "confidence": conf,
-                         "img": frame_filename
-                         })
-                     print("accident detected!", accident_log)
-                elif c == "non-accident":
-                    #ไม่แสดง non-accident
-                    continue
-                elif c != "accident" and conf >= 0.5:
-                    detected_objects.append(c)
-                    color = (0, 255, 0)
+
+        try:
+            if not results or results[0].boxes is None:
+                print(f"[frame {count}] no detections")
+            else:
+                boxes_obj = results[0].boxes
+
+                # safe attribute extraction
+                boxes = boxes_obj.xyxy.int().cpu().tolist() if getattr(boxes_obj, "xyxy", None) is not None else []
+                class_ids = boxes_obj.cls.int().cpu().tolist() if getattr(boxes_obj, "cls", None) is not None else []
+                confidences = boxes_obj.conf.cpu().tolist() if getattr(boxes_obj, "conf", None) is not None else []
+                track_ids = boxes_obj.id.int().cpu().tolist() if getattr(boxes_obj, "id", None) is not None else [None] * len(class_ids)
+
+                # debug print
+                debug_list = []
+                for i, cid in enumerate(class_ids):
+                    conf = confidences[i] if i < len(confidences) else 0.0
+                    label = names[cid] if isinstance(names, (list, dict)) else str(cid)
+                    debug_list.append((label, float(conf)))
+                print(f"[frame {count}] detections:", debug_list)
+
+                # draw all boxes (accident red, others green)
+                for i in range(len(class_ids)):
+                    box = boxes[i] if i < len(boxes) else [0, 0, 0, 0]
+                    class_id = class_ids[i]
+                    track_id = track_ids[i] if i < len(track_ids) else None
+                    conf = confidences[i] if i < len(confidences) else 0.0
+                    label = names[class_id] if isinstance(names, (list, dict)) else str(class_id)
+
+                    x1, y1, x2, y2 = map(int, box)
+                    is_accident = (label == ACCIDENT_CLASS_NAME and conf >= ACCIDENT_CONF_THRESHOLD)
+                    color = (0, 0, 255) if is_accident else (0, 255, 0)
+
+                    # draw rectangle and text for every detection
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(frame, f'{track_id} - {c} ({conf:.2f})', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                    print("accident detected!", accident_log)
+                    cv2.putText(frame, f'{track_id} - {label} ({conf:.2f})', (x1, max(15, y1 - 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
+                    # record detected object label (skip 'non-accident' if desired)
+                    if label != "non-accident":
+                        detected_objects.append(label)
+
+                    # if it's a confident accident, save frame (with drawn boxes) and log it
+                    if is_accident:
+                        frame_filename = f"{filename}_frame_{count}.jpg"
+                        frame_path = os.path.join(ACCIDENT_FRAME_DIR, frame_filename)
+                        # save the frame after drawing boxes so saved image includes the red box
+                        cv2.imwrite(frame_path, frame)
+                        sec = int(count / fps)
+                        # avoid duplicate entries for same frame
+                        if not accident_log or accident_log[-1].get("frame") != count:
+                            accident_log.append({
+                                "frame": count,
+                                "time": sec,
+                                "box": [x1, y1, x2, y2],
+                                "confidence": conf,
+                                "img": frame_filename
+                            })
+                            print("RED ACCIDENT LOGGED:", frame_filename, conf)
+
+        except Exception as e:
+            print(f"Exception processing frame {count}:", e)
+
+        # update shared state for frontend
         detected_objects_by_file[filename] = detected_objects
-        accident_log_by_file[filename] = accident_log  # อัพเดต log ทุกเฟรม
+        accident_log_by_file[filename] = accident_log
 
+        # encode frame for MJPEG stream (frame with boxes)
         _, buffer = cv2.imencode('.jpg', frame)
-        frame = buffer.tobytes()
+        frame_bytes = buffer.tobytes()
 
         yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
 @app.route('/video_feed/<filename>')
 def video_feed(filename):
     video_path = os.path.join('uploads', filename)
@@ -170,15 +176,10 @@ def accident_log(filename):
 def accident_frame(filename):
     frame_num = int(request.args.get('frame', 0))
     frame_filename = f"{filename}_frame_{frame_num}.jpg"
-    frame_path = os.path.join("accident_frames", frame_filename)
-    video_path_ = os.path.join('uploads', filename)
-    cap = cv2.VideoCapture(video_path_)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-    ret, frame = cap.read()
-    cap.release()
+    frame_path = os.path.join(ACCIDENT_FRAME_DIR, frame_filename)
     if not os.path.exists(frame_path):
         return '', 404
     return send_file(frame_path, mimetype='image/jpeg')
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=8080, debug=True)
