@@ -1,11 +1,11 @@
 import os
 import cv2
+from collections import Counter
 from flask import Flask, render_template, Response, request, redirect, url_for, send_from_directory, jsonify, send_file
 from ultralytics import YOLO
 
 app = Flask(__name__)
 
-# ...existing code...
 model_path = os.path.join(os.path.dirname(__file__), "model", "best.pt")
 model = YOLO(model_path)
 names = model.model.names
@@ -15,7 +15,7 @@ print("MODEL CLASS NAMES:", names)
 ACCIDENT_CLASS_NAME = "accident"   # เปลี่ยนถ้าชื่อคลาสใน model ต่างกัน
 ACCIDENT_CONF_THRESHOLD = 0.1
 PROCESS_EVERY_N = 1
-TRACK_CONF = 0.25   # ค่าเริ่มต้นสำหรับ model.track ตอนดีบัก -> ปรับเพิ่มเมื่อพร้อม
+TRACK_CONF = 0.45   # ค่าเริ่มต้นสำหรับ model.track ตอนดีบัก -> ปรับเพิ่มเมื่อพร้อม
 TRACK_IOU = 0.45
 
 detected_objects_by_file = {}
@@ -23,9 +23,6 @@ detected_objects_by_file = {}
 @app.route('/')
 def index():
     return render_template('index.html')
-
-# ...existing code...
-# (removed webcam routes and functions)
 
 @app.route('/upload', methods=['POST'])
 def upload_video():
@@ -74,12 +71,19 @@ def detect_objects_from_video(video_path, filename):
         # resize for inference / display
         frame = cv2.resize(frame, (1020, 600))
 
-        # run tracker/detector (adjust conf/iou when tuning)
-        results = model.track(frame, persist=True, conf=TRACK_CONF, iou=TRACK_IOU)
-
-        detected_objects = []
+        # initialize per-frame variables
+        frame_has_detection = False
+        class_ids = []
+        boxes = []
+        confidences = []
+        track_ids = []
 
         try:
+            # run tracker/detector (adjust conf/iou when tuning)
+            results = model.track(frame, persist=True, conf=TRACK_CONF, iou=TRACK_IOU)
+
+            detected_objects = []
+
             if not results or results[0].boxes is None:
                 print(f"[frame {count}] no detections")
             else:
@@ -99,7 +103,7 @@ def detect_objects_from_video(video_path, filename):
                     debug_list.append((label, float(conf)))
                 print(f"[frame {count}] detections:", debug_list)
 
-                # draw all boxes (accident red, others green)
+                # draw all boxes (accident red, others green) and save crops + frame
                 for i in range(len(class_ids)):
                     box = boxes[i] if i < len(boxes) else [0, 0, 0, 0]
                     class_id = class_ids[i]
@@ -116,18 +120,36 @@ def detect_objects_from_video(video_path, filename):
                     cv2.putText(frame, f'{track_id} - {label} ({conf:.2f})', (x1, max(15, y1 - 10)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
+                    frame_has_detection = True
+
+                    # --- บันทึกภาพ crop ของกรอบนี้ (ทุกกรอบ) ---
+                    # h, w = frame.shape[:2]
+                    # x1c, y1c = max(0, x1), max(0, y1)
+                    # x2c, y2c = min(w, x2), min(h, y2)
+                    # if x2c > x1c and y2c > y1c:
+                    #     crop = frame[y1c:y2c, x1c:x2c]
+                    #     safe_label = str(label).replace(" ", "_")
+                    #     crop_filename = f"{filename}_frame_{count}_box_{i}_{safe_label}_{int(conf*100)}.jpg"
+                    #     crop_path = os.path.join(DETECTION_FRAME_DIR, crop_filename)
+                        # try:
+                        #     cv2.imwrite(crop_path, crop)
+                        # except Exception as _e:
+                        #     print(f"Failed to write crop {crop_path}: {_e}")
+                    # --------------------------------------------------
+
                     # record detected object label (skip 'non-accident' if desired)
                     if label != "non-accident":
                         detected_objects.append(label)
 
-                    # if it's a confident accident, save frame (with drawn boxes) and log it
+                    # if it's a confident accident, save full-frame (with drawn boxes) and log it
                     if is_accident:
                         frame_filename = f"{filename}_frame_{count}.jpg"
                         frame_path = os.path.join(ACCIDENT_FRAME_DIR, frame_filename)
-                        # save the frame after drawing boxes so saved image includes the red box
-                        cv2.imwrite(frame_path, frame)
-                        sec = int(count / fps)
-                        # avoid duplicate entries for same frame
+                        try:
+                            cv2.imwrite(frame_path, frame)  # saved AFTER drawing boxes
+                        except Exception as _e:
+                            print(f"Failed to write accident frame {frame_path}: {_e}")
+                        sec = int(count / fps) if fps else count
                         if not accident_log or accident_log[-1].get("frame") != count:
                             accident_log.append({
                                 "frame": count,
@@ -137,6 +159,28 @@ def detect_objects_from_video(video_path, filename):
                                 "img": frame_filename
                             })
                             print("RED ACCIDENT LOGGED:", frame_filename, conf)
+
+            # --- overlay summary (total boxes & per-class counts) and save full-frame detection ---
+            total_boxes = len(class_ids)
+            class_labels = [names[cid] if isinstance(names, (list, dict)) else str(cid) for cid in class_ids]
+            counts = Counter(class_labels)
+            overlay_text = f"Detections: {total_boxes}"
+            cv2.putText(frame, overlay_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
+
+            y = 45
+            for lbl, cnt in counts.items():
+                line = f"{lbl}: {cnt}"
+                cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                y += 20
+
+            # save full-frame detection image once per frame (after drawing all boxes)
+            if frame_has_detection:
+                det_frame_filename = f"{filename}_detframe_{count}.jpg"
+                det_frame_path = os.path.join(DETECTION_FRAME_DIR, det_frame_filename)
+                try:
+                    cv2.imwrite(det_frame_path, frame)
+                except Exception as _e:
+                    print(f"Failed to write detection frame {det_frame_path}: {_e}")
 
         except Exception as e:
             print(f"Exception processing frame {count}:", e)
@@ -151,6 +195,8 @@ def detect_objects_from_video(video_path, filename):
 
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+    cap.release()
 
 @app.route('/video_feed/<filename>')
 def video_feed(filename):
