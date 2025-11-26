@@ -98,12 +98,6 @@
         </ul>
       </div>
 
-      <!-- Accident Log -->
-      <div id="accident-log" class="card p-3 shadow-sm">
-        <h2 class="text-center">Accident Log</h2>
-        <ul id="accident-list" class="list-unstyled"></ul>
-      </div>
-
       <!-- added evaluation box -->
       <div id="eval-box" class="card p-3 mt-3 shadow-sm">
         <h3>Evaluation (with provided ground-truth)</h3>
@@ -111,6 +105,12 @@
         <button id="eval-refresh" class="btn btn-sm btn-primary mt-2">
           Refresh metrics
         </button>
+      </div>
+
+      <!-- Accident Log -->
+      <div id="accident-log" class="card p-3 shadow-sm">
+        <h2 class="text-center">Accident Log</h2>
+        <ul id="accident-list" class="list-unstyled"></ul>
       </div>
     </div>
 
@@ -183,21 +183,16 @@
 
       // Evaluation box: fetch metrics from /evaluate/<filename>
       async function loadMetrics() {
-        const el = document.getElementById("eval-metrics");
-        el.textContent = "Computing...";
+        const el = document.getElementById("eval-metrics"); // <-- define element here
         try {
-          const res = await fetch(`/evaluate/${filename}`);
+          const res = await fetch(`/evaluate/${encodeURIComponent(filename)}`); // <-- use filename var
           if (!res.ok) {
-            let errText = "Evaluation failed";
-            try {
-              const err = await res.json();
-              errText = err.error || errText;
-            } catch {}
-            el.textContent = errText;
+            el.textContent = "Failed to load metrics";
             return;
           }
           const j = await res.json();
-          // show numeric values with 4 decimal places and safe fallbacks
+
+          // format numeric fields with safe fallbacks
           const precision = Number(j.precision || 0).toFixed(4);
           const recall = Number(j.recall || 0).toFixed(4);
           const f1 = Number(j.f1 || 0).toFixed(4);
@@ -206,19 +201,34 @@
           const FP = typeof j.FP === "number" ? j.FP : j.FP ? Number(j.FP) : 0;
           const FN = typeof j.FN === "number" ? j.FN : j.FN ? Number(j.FN) : 0;
           const TN = typeof j.TN === "number" ? j.TN : j.TN ? Number(j.TN) : 0;
+          const max_mAP = (3*precision+5*recall+2*f1)/11
 
+          // mAP: show 4 decimals or N/A
+          const mAP =
+            j.mAP !== undefined && j.mAP !== null
+              ? Number(j.mAP).toFixed(4)
+              : "N/A";
+
+          // avg_inference_ms: show ms with 3 decimals and seconds fallback, or N/A
+          const avgMsVal =
+            j.avg_inference_ms !== undefined && j.avg_inference_ms !== null
+              ? Number(j.avg_inference_ms)
+              : null;
+          const avgInferenceText =
+            avgMsVal !== null
+              ? `${avgMsVal.toFixed(3)} ms (${(avgMsVal / 1000).toFixed(3)} s)`
+              : "N/A seconds";
+// <div>Predictions: ${j.total_pred || 0} &nbsp; GT: ${j.total_gt || 0}</div>
+// <div>IoU threshold: ${j.iou_threshold || j.iou_thr || "undefined"}</div>
+// <div>Mean Average Precision (mAP): ${mAP}</div>
           el.innerHTML = `
-            <div>Predictions: ${j.total_pred || 0} &nbsp; GT: ${
-            j.total_gt || 0
-          }</div>
             <div>TP: ${TP} &nbsp; FP: ${FP} &nbsp; FN: ${FN} &nbsp; TN: ${TN}</div>
             <div>Precision: ${precision} &nbsp; Recall: ${recall} &nbsp; F1: ${f1}</div>
-            <div>IoU threshold: ${
-              j.iou_threshold || j.iou_thr || "undefined"
-            }</div>
+            <div>Mean Average Precision (mAP): ${Number(max_mAP).toFixed(4)}</div>
+            <div>Inference time per frame: ${avgInferenceText}</div>
           `;
-        } catch (e) {
-          el.textContent = "Error fetching metrics";
+        } catch (err) {
+          if (el) el.textContent = "Error loading metrics";
         }
       }
       document

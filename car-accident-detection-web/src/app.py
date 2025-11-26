@@ -2,6 +2,7 @@ import csv
 import math
 import os
 from collections import Counter
+import time
 
 import cv2
 from flask import (
@@ -41,6 +42,7 @@ LABEL_REMAP = {
 detected_objects_by_file = {}
 accident_log_by_file = {}
 all_detections_by_file = {}   # <-- เพิ่มตัวเก็บทุก detection (ทุกคลาส / ทุกเฟรม)
+inference_stats_by_file = {}  # เก็บเวลาการทำ inference: {'total_time': float_seconds, 'count': int}
 
 ACCIDENT_FRAME_DIR = "accident_frames"
 os.makedirs(ACCIDENT_FRAME_DIR, exist_ok=True)
@@ -167,18 +169,95 @@ def load_gt_for_video(filename):
             # if no valid GT entries found, treat as not found
             return gt if gt else None
     return None
+# --- เพิ่มฟังก์ชันคำนวณ AP (สำหรับคลาสเดียว เช่น "accident") ---
+def compute_ap(preds, gts, iou_thr=0.5, class_name=ACCIDENT_CLASS_NAME):
+    """
+    Simple AP calculation:
+    - preds: list of detections with keys ['frame','box','confidence','label']
+    - gts: list of GT entries with keys ['frame','box','label']
+    - match per-frame, one-to-one, by best IoU >= iou_thr
+    Returns AP (0..1)
+    """
+    # filter preds for class and sort by confidence desc
+    preds_c = [p for p in preds if p.get("label") == class_name]
+    preds_c.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
+
+    # index GTs by frame and mark unmatched
+    gt_by_frame = {}
+    total_gts = 0
+    for i, g in enumerate(gts):
+        if g.get("label") != class_name:
+            continue
+        gt_by_frame.setdefault(g["frame"], []).append({"box": g["box"], "matched": False})
+        total_gts += 1
+
+    if total_gts == 0:
+        return 0.0
+
+    tps = []
+    fps = []
+
+    for p in preds_c:
+        pf = p.get("frame")
+        pbox = p.get("box")
+        candidates = gt_by_frame.get(pf, [])
+        best_iou = 0.0
+        best_idx = None
+        for idx, cg in enumerate(candidates):
+            if cg["matched"]:
+                continue
+            val = iou(pbox, cg["box"])
+            if val > best_iou:
+                best_iou = val
+                best_idx = idx
+        if best_iou >= iou_thr and best_idx is not None:
+            # true positive
+            candidates[best_idx]["matched"] = True
+            tps.append(1)
+            fps.append(0)
+        else:
+            # false positive
+            tps.append(0)
+            fps.append(1)
+
+    # cumulative sums
+    cum_tp = []
+    cum_fp = []
+    s_tp = s_fp = 0
+    for tp, fp in zip(tps, fps):
+        s_tp += tp
+        s_fp += fp
+        cum_tp.append(s_tp)
+        cum_fp.append(s_fp)
+
+    precisions = []
+    recalls = []
+    for ct, cf in zip(cum_tp, cum_fp):
+        prec = ct / (ct + cf) if (ct + cf) > 0 else 0.0
+        rec = ct / total_gts
+        precisions.append(prec)
+        recalls.append(rec)
+
+    # interpolate precision to get AP (VOC-like)
+    mrec = [0.0] + recalls + [1.0]
+    mpre = [0.0] + precisions + [0.0]
+    for i in range(len(mpre) - 2, -1, -1):
+        if mpre[i] < mpre[i + 1]:
+            mpre[i] = mpre[i + 1]
+    ap = 0.0
+    for i in range(1, len(mrec)):
+        if mrec[i] != mrec[i - 1]:
+            ap += (mrec[i] - mrec[i - 1]) * mpre[i]
+    return ap
 
 
 @app.route("/evaluate/<filename>")
 def evaluate(filename):
     """
-    Simple evaluation mode: count TP/FP by box color.
-    - TP: count of green boxes (is_accident == False)
-    - FP: count of red boxes (is_accident == True)
-    Still returns precision/recall/f1; total_gt read if available.
-    Accept optional ?iou= to report IoU threshold (no effect in color-count mode).
+    Simple evaluation mode: count TP/FP by box color and also report IoU-based mAP
+    and inference time (average ms per frame).
+    Accept optional ?iou= to control IoU threshold used for AP and display.
     """
-    # allow optional IoU query param (for display / downstream switching)
     try:
         iou_thr = float(request.args.get("iou", 0.5))
     except Exception:
@@ -187,31 +266,26 @@ def evaluate(filename):
     gts = load_gt_for_video(filename) or []
     preds = all_detections_by_file.get(filename, []) or []
 
-    # load GT if present (keeps previous behavior)
-    gt = load_gt_for_video(filename)
-    total_gt = 0
-    if gt is not None:
-        total_gt = sum(1 for _ in gt)
-
-    # get all detections recorded during processing
-    dets = all_detections_by_file.get(filename, []) or []
+    # existing color-count style metrics (kept for backward compatibility)
+    total_gt = sum(1 for _ in gts) if gts is not None else 0
+    dets = preds
+    total_pred = len(dets)
 
     # ตามคำขอ: นับ TP +1 สำหรับทุกการตรวจจับ (ทุกค่า) และนับ FP +1 เมื่อกรอบเป็นสีเขียว (non-accident)
-    total_pred = len(dets)
     TP = total_pred
     FP = sum(1 for d in dets if not d.get("is_accident", False))
 
-    # count accident detections with confidence lower than 0.75 -> each increases FN by 1
-    low_conf_threshold = 0.85
+    # count accident detections with confidence lower than threshold -> each increases FN by 1
+    low_conf_threshold = 0.75
     low_conf_accidents = sum(
         1
         for d in dets
         if (d.get("label") == ACCIDENT_CLASS_NAME) and (d.get("confidence", 0.0) < low_conf_threshold)
     )
 
-    # FN: remaining GT not covered by TP (simple fallback) plus low-confidence accident detections
     FN = max(0, total_gt - TP) + low_conf_accidents
 
+    # frame-level TN as before
     frames_seen = set()
     for p in preds:
         frames_seen.add(p.get("frame"))
@@ -229,6 +303,15 @@ def evaluate(filename):
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
+    # --- compute AP (mAP for single class 'accident') using IoU matching at iou_thr ---
+    ap = compute_ap(preds, gts, iou_thr=iou_thr, class_name=ACCIDENT_CLASS_NAME)
+    # print("AP",preds, gts, iou_thr=iou_thr, class_name=ACCIDENT_CLASS_NAME)
+    mAP = ap  # only one class here
+
+    # --- inference time stats ---
+    stats = inference_stats_by_file.get(filename, {"total_time": 0.0, "count": 0})
+    avg_inference_ms = (stats["total_time"] / stats["count"] * 1000.0) if stats["count"] > 0 else None
+
     metrics = {
         "TP": TP,
         "FP": FP,
@@ -243,6 +326,8 @@ def evaluate(filename):
         "iou_threshold": iou_thr,
         "track_conf_threshold": TRACK_CONF,
         "low_conf_accidents": low_conf_accidents,
+        "mAP": round(mAP, 4),
+        "avg_inference_ms": round(avg_inference_ms, 3) if avg_inference_ms is not None else None,
     }
     return jsonify(metrics)
 
@@ -253,6 +338,9 @@ def detect_objects_from_video(video_path, filename):
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     accident_log = []
     detections = []  # เก็บทุกรายการ detection (ทุกคลาส ทุกเฟรม)
+
+    # ensure stats entry
+    inference_stats_by_file.setdefault(filename, {"total_time": 0.0, "count": 0})
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -277,7 +365,12 @@ def detect_objects_from_video(video_path, filename):
 
         try:
             # run tracker/detector (adjust conf/iou when tuning)
+            t0 = time.time()
             results = model.track(frame, persist=True, conf=TRACK_CONF, iou=TRACK_IOU)
+            t1 = time.time()
+            # record inference time
+            inference_stats_by_file[filename]["total_time"] += (t1 - t0)
+            inference_stats_by_file[filename]["count"] += 1
 
             if not results or results[0].boxes is None:
                 print(f"[frame {count}] no detections")
