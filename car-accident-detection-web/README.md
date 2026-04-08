@@ -56,3 +56,7 @@ Feel free to contribute to this project by submitting issues or pull requests.
 ## License
 
 This project is licensed under the MIT License.
+
+## วิธีรัน
+cd เข้าไปให้ถึง .\pj_ss\car-accident-detection-web\src
+ต่อไปก็รันที่ cmd ให้พิมพ์ว่า python app.py
