@@ -42,7 +42,24 @@
   <body>
     <div class="container">
       <div class="card p-4">
-        <h1>YOLO Object Detection</h1>
+        <h1>🚨 Car Accident Detection</h1>
+        <p style="text-align: center; color: #666; font-size: 14px; margin-bottom: 20px;">
+          Uses CLAHE enhancement + Dual Model (Accident Detection + Vehicle Counting)
+        </p>
+
+        <!-- Flash Messages -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for category, message in messages %}
+              <div class="alert alert-{{ 'success' if category == 'success' else 'danger' }} alert-dismissible fade show" role="alert">
+                {{ message }}
+                <button type="button" class="close" data-dismiss="alert" aria-label="Close">
+                  <span aria-hidden="true">&times;</span>
+                </button>
+              </div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
 
         <!-- Upload Section -->
         <form
@@ -60,16 +77,40 @@
           </button>
         </form>
 
-        <!-- <hr /> -->
+        <!-- URL Upload Section -->
+        <!-- <div class="text-center mb-3">
+          <span style="color: #666; font-size: 14px;">or</span>
+        </div>
+        <form action="/upload_url" method="post" class="mb-4">
+          <div class="mb-3">
+            <label class="form-label">Upload from URL:</label>
+            <input
+              type="url"
+              class="form-control"
+              name="video_url"
+              placeholder="https://example.com/video.mp4 หรือ https://www.w3schools.com/html/mov_bbb.mp4"
+              required
+            />
+            <small class="form-text text-muted">รองรับไฟล์วิดีโอจาก URL สาธารณะ</small>
+          </div>
+          <button type="submit" class="btn btn-success btn-custom w-100">
+            Download & Detect
+          </button>
+        </form> -->
 
-        <!-- URL Section -->
-        <!-- <form action="/link" method="post">
-                <div class="mb-3">
-                    <label class="form-label">Video URL:</label>
-                    <input type="text" class="form-control" name="url" placeholder="Enter video link..." required>
-                </div>
-                <button type="submit" class="btn btn-success btn-custom w-100">Play from URL</button>
-            </form> -->
+        <!-- Features Info -->
+        <!-- <div class="alert alert-info" role="alert" style="font-size: 13px; margin-top: 20px;">
+          <strong>Features:</strong>
+          <ul style="margin: 10px 0 0 20px;">
+            <li>✅ CLAHE Enhancement for better contrast</li>
+            <li>✅ Accident Detection with confidence threshold</li>
+            <li>✅ Vehicle Counting in accident area</li>
+            <li>✅ Full-frame vehicle detection</li>
+            <li>✅ Telegram Alerts (can be enabled)</li>
+            <li>✅ Upload from file or URL</li>
+            <li>✅ Performance metrics & evaluation</li>
+          </ul>
+        </div> -->
       </div>
     </div>
   </body>

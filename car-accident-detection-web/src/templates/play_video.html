@@ -69,11 +69,36 @@
         margin-top: 10px;
         max-width: 100%;
       }
+      #frames-container img {
+        border-radius: 5px;
+        margin-top: 5px;
+        max-width: 100%;
+      }
+      #frames-container > div {
+        background: #f8f9fa;
+        border-radius: 8px;
+        padding: 8px;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+      }
     </style>
   </head>
   <body>
     <div class="container">
-      <h1 class="text-center mb-4">YOLO Video Detection</h1>
+      <h1 class="text-center mb-4">🚨 Car Accident Detection & Analysis</h1>
+
+      <!-- System Info Alert -->
+      <!-- <div class="alert alert-warning alert-dismissible fade show" role="alert" style="margin-bottom: 20px;">
+        <strong>System Status:</strong>
+        <ul style="margin: 8px 0 0 20px;">
+          <li>✅ CLAHE Enhancement: Active (improved contrast)</li>
+          <li>✅ Dual Model Detection: Accident + Vehicles</li>
+          <li>📱 Telegram Alerts: Check backend configuration</li>
+          <li>📊 Real-time vehicle counting in accident areas</li>
+        </ul>
+        <button type="button" class="close" data-dismiss="alert" aria-label="Close">
+          <span aria-hidden="true">&times;</span>
+        </button>
+      </div> -->
 
       <!-- Video Player -->
       <div id="video-container">
@@ -91,33 +116,40 @@
       </div>
 
       <!-- Detected Objects -->
-      <div id="detected-objects" class="card p-3 mb-4 shadow-sm">
+      <!-- <div id="detected-objects" class="card p-3 mb-4 shadow-sm">
         <h2 class="text-center">Detected Objects</h2>
         <ul id="objects-list" class="d-flex flex-wrap justify-content-center">
           <li>Loading...</li>
         </ul>
-      </div>
+      </div> -->
 
       <!-- added evaluation box -->
-      <div id="eval-box" class="card p-3 mt-3 shadow-sm">
+      <!-- <div id="eval-box" class="card p-3 mt-3 shadow-sm">
         <h3>Evaluation (with provided ground-truth)</h3>
         <div id="eval-metrics">Loading...</div>
         <button id="eval-refresh" class="btn btn-sm btn-primary mt-2">
           Refresh metrics
         </button>
-      </div>
+      </div> -->
 
       <!-- Accident Log -->
       <div id="accident-log" class="card p-3 shadow-sm">
         <h2 class="text-center">Accident Log</h2>
         <ul id="accident-list" class="list-unstyled"></ul>
       </div>
+
+      <!-- Detection Frames -->
+      <!-- <div id="detection-frames" class="card p-3 shadow-sm">
+        <h2 class="text-center">Detection Frames</h2>
+        <div id="frames-container" class="d-flex flex-wrap justify-content-center gap-3"></div>
+      </div> -->
     </div>
 
     <script>
       const filename = "{{ filename }}";
       let detectedObjectsInterval = setInterval(updateDetectedObjects, 1000);
       let accidentLogInterval = setInterval(updateAccidentLog, 1000);
+      let detectionFramesInterval = setInterval(updateDetectionFrames, 2000); // Update less frequently
 
       function updateDetectedObjects() {
         fetch(`/detected_objects/${filename}`)
@@ -129,6 +161,7 @@
               ul.innerHTML = "<li>Video ended.</li>";
               clearInterval(detectedObjectsInterval);
               clearInterval(accidentLogInterval);
+              clearInterval(detectionFramesInterval);
             } else if (data.length > 0) {
               data.forEach((obj) => {
                 const li = document.createElement("li");
@@ -155,18 +188,26 @@
               ul.innerHTML = "<li>Video ended.</li>";
               clearInterval(accidentLogInterval);
               clearInterval(detectedObjectsInterval);
+              clearInterval(detectionFramesInterval);
             } else if (data.length > 0) {
               data.forEach((item) => {
                 const li = document.createElement("li");
+                
+                // Build vehicle info string
+                let vehicleInfoHtml = "";
+                if (item.vehicle_counts && Object.keys(item.vehicle_counts).length > 0) {
+                  vehicleInfoHtml = "<div style='margin-top: 5px; font-size: 12px; color: #27ae60;'><strong>Vehicles:</strong>";
+                  for (const [vname, vcount] of Object.entries(item.vehicle_counts)) {
+                    vehicleInfoHtml += `<br>• ${vname}: ${vcount}`;
+                  }
+                  vehicleInfoHtml += "</div>";
+                }
+                
                 li.innerHTML = `
                   <div>
-                    <span>Time: ${item.time} sec</span><br>
-                    <span>Confidence: ${(item.confidence * 100).toFixed(
-                      2
-                    )}%</span><br>
-                    <img src="/accident_frame/${filename}?frame=${
-                  item.frame
-                }" width="300" onerror="this.style.display='none'; this.parentNode.appendChild(document.createTextNode('Image not found'));" />
+                    <span>⏱️ Time: ${item.time} sec</span><br>
+                    <span>📊 Confidence: ${(item.confidence * 100).toFixed(2)}%</span>${vehicleInfoHtml}<br>
+                    <img src="/detection_frame/${filename}?frame=${item.frame}" width="300" onerror="this.style.display='none'; this.parentNode.appendChild(document.createTextNode('Image not found'));" />
                   </div>
                 `;
                 ul.appendChild(li);
@@ -180,6 +221,39 @@
           });
       }
       updateAccidentLog();
+
+      function updateDetectionFrames() {
+        fetch(`/detection_frames/${filename}`)
+          .then((response) => response.json())
+          .then((frames) => {
+            const container = document.getElementById("frames-container");
+            container.innerHTML = "";
+            
+            if (frames.length > 0) {
+              // Show last 10 frames to avoid too many images
+              const recentFrames = frames.slice(-10);
+              
+              recentFrames.forEach((frameNum) => {
+                const div = document.createElement("div");
+                div.className = "text-center";
+                div.innerHTML = `
+                  <div style="font-size: 12px; color: #666;">Frame ${frameNum}</div>
+                  <img src="/detection_frame/${filename}?frame=${frameNum}" 
+                       width="200" 
+                       style="border: 1px solid #ddd; border-radius: 5px;"
+                       onerror="this.style.display='none';" />
+                `;
+                container.appendChild(div);
+              });
+            } else {
+              container.innerHTML = "<div class='text-center text-muted'>No detection frames yet.</div>";
+            }
+          })
+          .catch(() => {
+            // optional: keep previous content on error
+          });
+      }
+      updateDetectionFrames();
 
       // Evaluation box: fetch metrics from /evaluate/<filename>
       async function loadMetrics() {
