@@ -64,7 +64,7 @@ TARGET_VEHICLE_CLASSES = ["car", "motorcycle", "bus", "truck"]
 
 # ===== PERFORMANCE OPTIMIZATION SETTINGS =====
 ACCIDENT_CLASS_NAME = "accident"
-ACCIDENT_CONF_THRESHOLD = 0.8
+ACCIDENT_CONF_THRESHOLD = 0.75  # Increased from 0.4 → fewer false positives, faster
 PROCESS_EVERY_N = 2          # Process every 2nd frame (was 3) → smoother playback (15fps from 30fps)
 TRACK_CONF = 0.55           # Increased from 0.45 → less false positives, faster
 TRACK_IOU = 0.45
@@ -142,6 +142,7 @@ def send_telegram_alert(image_array, detected_class, conf, vehicle_counts, filen
         )
 
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+        # url = f""
         files_data = {'photo': ('alert.jpg', img_byte_arr, 'image/jpeg')}
         data = {'chat_id': TARGET_CHAT_ID, 'caption': caption}
 
@@ -477,7 +478,7 @@ def evaluate(filename):
     dets = preds
     total_pred = len(dets)
 
-    # ตามคำขอ: นับ TP +1 สำหรับทุกการตรวจจับ (ทุกค่า) และนับ FP +1 เมื่อกรอบเป็นสีเขียว (non-accident)
+    # นับ TP +1 สำหรับทุกการตรวจจับ (ทุกค่า) และนับ FP +1 เมื่อกรอบเป็นสีเขียว (non-accident)
     TP = total_pred
     FP = sum(1 for d in dets if not d.get("is_accident", False))
 
