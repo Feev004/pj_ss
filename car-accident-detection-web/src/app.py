@@ -1,16 +1,19 @@
-import os
-from collections import Counter
-import time
-import datetime
-import requests
-import io
-import pytz
-import hashlib
 import csv
+import datetime
 import glob
+import hashlib
+import io
+import ipaddress
+import os
+import socket
+import threading
+import time
 from urllib.parse import urlparse
 
 import cv2
+import numpy as np
+import pytz
+import requests
 from flask import (
     Flask,
     Response,
@@ -19,32 +22,89 @@ from flask import (
     redirect,
     render_template,
     request,
-    send_file,
     send_from_directory,
     url_for,
 )
+from flask_cors import CORS
+from PIL import Image as PILImage
 from ultralytics import YOLO
 from werkzeug.utils import secure_filename
-from PIL import Image as PILImage
 
 app = Flask(__name__)
+# Enable CORS for Next.js frontend communication
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
+# Limit maximum upload size to 500 MB (DoS protection)
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "accident_detection_secret_key_2026")
+
+# --- DIRECTORY CONFIGURATION (Absolute paths to avoid CWD ambiguity) ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
+ACCIDENT_FRAME_DIR = os.path.join(BASE_DIR, "accident_frames")
+DETECTION_FRAME_DIR = os.path.join(BASE_DIR, "detection_frames")
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(ACCIDENT_FRAME_DIR, exist_ok=True)
+os.makedirs(DETECTION_FRAME_DIR, exist_ok=True)
+
+ALLOWED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+MAX_DOWNLOAD_SIZE = 250 * 1024 * 1024  # 250 MB limit for URL downloads
+
+# --- SECURITY & THREAD LOCK ---
+data_lock = threading.Lock()
+
+def safe_filename(name):
+    """Sanitize filename to prevent directory traversal attacks"""
+    if not name:
+        return ""
+    clean = secure_filename(os.path.basename(name))
+    return clean
+
+def is_allowed_file(filename):
+    """Validate file extension against whitelist"""
+    _, ext = os.path.splitext(filename)
+    return ext.lower() in ALLOWED_EXTENSIONS
+
+def is_safe_url(url_str):
+    """Prevent SSRF attacks against internal network, localhost, or cloud metadata endpoints"""
+    try:
+        parsed = urlparse(url_str)
+        if parsed.scheme not in ("http", "https"):
+            return False, "โปรโตคอลต้องเป็น http หรือ https เท่านั้น"
+        hostname = parsed.hostname
+        if not hostname:
+            return False, "ไม่พบ hostname ใน URL"
+        if hostname.lower() in ("localhost", "127.0.0.1", "::1"):
+            return False, "ไม่อนุญาตให้เข้าถึง localhost หรือที่อยู่ภายในระบบ"
+        
+        # Resolve hostname to IP address
+        ip_str = socket.gethostbyname(hostname)
+        ip = ipaddress.ip_address(ip_str)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return False, "ไม่อนุญาตให้เข้าถึงที่อยู่ IP เครือข่ายภายใน (SSRF Protection)"
+        return True, ""
+    except Exception as e:
+        return False, f"ไม่สามารถตรวจสอบความปลอดภัยของ URL ได้: {e!s}"
 
 # --- CONFIGURATION ---
-model_path = os.path.join(os.path.dirname(__file__), "model", "best.pt")
+model_path = os.path.join(BASE_DIR, "model", "best.pt")
 model = YOLO(model_path)
-names = model.model.names
+names = getattr(model, "names", {})
+if not names and getattr(model, "model", None) is not None:
+    names = getattr(model.model, "names", {})
 print("MODEL CLASS NAMES:", names)
 
-# Telegram Configuration
-BOT_TOKEN = "7692550301:AAGPTJrcCDdXuitHRNQep85UhfSUcXMxNkc"
-TARGET_CHAT_ID = "-4887423941"
-ENABLE_TELEGRAM = True  # ตั้งเป็น True เมื่อต้องการส่ง Telegram
+# Telegram Configuration (supports environment variables)
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7692550301:AAGPTJrcCDdXuitHRNQep85UhfSUcXMxNkc")
+TARGET_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-4887423941")
+ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM", "False").lower() in ("true", "1", "yes")
 
 # Vehicle detection model (สำหรับนับรถในกรอบ accident)
-# Try multiple path options
 VEHICLE_MODEL_PATHS = [
-    os.path.join(os.path.dirname(__file__), "..", "..", "testmo", "model11n", "yolov11n.pt"),
-    os.path.join(os.path.dirname(__file__), "..", "testmo", "model11n", "yolov11n.pt"),
+    os.path.join(BASE_DIR, "..", "..", "testmo", "model11n", "yolov11n.pt"),
+    os.path.join(BASE_DIR, "..", "testmo", "model11n", "yolov11n.pt"),
+    os.path.join(BASE_DIR, "model", "yolov11n.pt"),
     "testmo/model11n/yolov11n.pt",
 ]
 vehicle_model = None
@@ -58,18 +118,23 @@ for vpath in VEHICLE_MODEL_PATHS:
             print(f"   โหลดโมเดล {vpath} ล้มเหลว: {e}")
             continue
 if vehicle_model is None:
-    print(f"⚠️  ไม่พบไฟล์โมเดล vehicle - จะใช้เฉพาะ accident detection")
+    print("⚠️  ไม่พบไฟล์โมเดล vehicle - จะใช้เฉพาะ accident detection")
 
 TARGET_VEHICLE_CLASSES = ["car", "motorcycle", "bus", "truck"]
 
-# ===== PERFORMANCE OPTIMIZATION SETTINGS =====
+# ===== PERFORMANCE & INTELLIGENT ACCIDENT DETECTION SETTINGS =====
 ACCIDENT_CLASS_NAME = "accident"
-ACCIDENT_CONF_THRESHOLD = 0.75  # Increased from 0.4 → fewer false positives, faster
-PROCESS_EVERY_N = 2          # Process every 2nd frame (was 3) → smoother playback (15fps from 30fps)
-TRACK_CONF = 0.55           # Increased from 0.45 → less false positives, faster
+ACCIDENT_CONF_THRESHOLD = 0.70  # Sensitivity threshold for accident candidates
+PROCESS_EVERY_N = 2             # Frame skip (smooth 15fps playback from 30fps)
+TRACK_CONF = 0.50               # Tracker confidence
 TRACK_IOU = 0.45
-VEHICLE_DETECTION_CONF = 0.45
-DETECT_VEHICLES_FULL_FRAME = True  # Enable full-frame detection (runs async in background)
+VEHICLE_DETECTION_CONF = 0.40
+DETECT_VEHICLES_FULL_FRAME = False
+
+# --- SMART TEMPORAL & SPATIAL FILTERS (False Positive Reducer) ---
+MIN_ACCIDENT_STREAK = 2          # Must be detected across at least 2 consecutive processed frames
+ACCIDENT_COOLDOWN_SEC = 3.5      # Minimum seconds between distinct logged accident events (prevents log flooding)
+CONFIRMED_HIGH_CONF = 0.85       # If single frame confidence is >= 85%, mark confirmed immediately
 
 LABEL_REMAP = {
     "non-accident": "car",
@@ -82,39 +147,61 @@ accident_log_by_file = {}
 all_detections_by_file = {}   # Store all detections for evaluation
 inference_stats_by_file = {}  # Track inference time per file
 
-ACCIDENT_FRAME_DIR = "accident_frames"
-os.makedirs(ACCIDENT_FRAME_DIR, exist_ok=True)
-
-DETECTION_FRAME_DIR = "detection_frames"
-os.makedirs(DETECTION_FRAME_DIR, exist_ok=True)
-
-
 # --- HELPER FUNCTIONS ---
-def apply_clahe(image):
-    """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to enhance image contrast"""
+def apply_adaptive_enhancement(image):
+    """
+    Apply Adaptive Contrast & Lighting Enhancement:
+    Automatically measures average luminosity to adaptively enhance contrast
+    without washing out daylight frames or leaving night scenes in pitch dark.
+    """
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    mean_lum = float(np.mean(l))
+
+    # Low-light / Night enhancement
+    if mean_lum < 75.0:
+        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+    elif mean_lum > 185.0:
+        # High-glare / Bright daylight
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    else:
+        # Normal lighting
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+
     cl = clahe.apply(l)
     limg = cv2.merge((cl, a, b))
     final_img = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
     return final_img
 
+# Alias for backward compatibility
+apply_clahe = apply_adaptive_enhancement
 
-def send_telegram_alert_async(image_array, detected_class, conf, vehicle_counts, filename):
-    """Send alert notification to Telegram (runs in background thread)"""
-    if not ENABLE_TELEGRAM or not TARGET_CHAT_ID:
-        return
+
+def to_list_safe(val, to_int=False):
+    """Safely converts PyTorch tensor, numpy array, or list to Python list without type errors."""
+    if val is None:
+        return []
     try:
-        send_telegram_alert(image_array, detected_class, conf, vehicle_counts, filename)
-    except Exception as e:
-        print(f"⚠️  Telegram alert error: {e}")
+        if hasattr(val, "cpu"):
+            val = val.cpu()
+        if hasattr(val, "numpy"):
+            val = val.numpy()
+        if isinstance(val, np.ndarray):
+            if to_int:
+                val = val.astype(int)
+            return val.tolist()
+        if hasattr(val, "tolist"):
+            return val.tolist()
+        return list(val)
+    except Exception:
+        return []
+
 
 def send_telegram_alert(image_array, detected_class, conf, vehicle_counts, filename):
     """Send alert notification to Telegram with image and vehicle counts"""
     if not ENABLE_TELEGRAM or not TARGET_CHAT_ID:
         return
-    
+
     tz_TH = pytz.timezone('Asia/Bangkok')
     current_time = datetime.datetime.now(tz_TH).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -142,14 +229,23 @@ def send_telegram_alert(image_array, detected_class, conf, vehicle_counts, filen
         )
 
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-        # url = f""
         files_data = {'photo': ('alert.jpg', img_byte_arr, 'image/jpeg')}
         data = {'chat_id': TARGET_CHAT_ID, 'caption': caption}
 
         requests.post(url, files=files_data, data=data, timeout=5)
-        print(f"✅ ส่งแจ้งเตือน Telegram สำเร็จ!")
+        print("✅ ส่งแจ้งเตือน Telegram สำเร็จ!")
     except Exception as e:
         print(f"❌ Error sending telegram: {e}")
+
+
+def send_telegram_alert_async(image_array, detected_class, conf, vehicle_counts, filename):
+    """Send alert notification to Telegram (runs in background thread)"""
+    if not ENABLE_TELEGRAM or not TARGET_CHAT_ID:
+        return
+    try:
+        send_telegram_alert(image_array, detected_class, conf, vehicle_counts, filename)
+    except Exception as e:
+        print(f"⚠️  Telegram alert error: {e}")
 
 
 @app.route("/")
@@ -159,30 +255,68 @@ def index():
 
 @app.route("/upload", methods=["POST"])
 def upload_video():
+    is_json = (
+        request.headers.get("Accept") == "application/json"
+        or request.is_json
+        or request.args.get("format") == "json"
+    )
 
     if "file" not in request.files:
+        err = "ไม่พบไฟล์ที่อัปโหลด"
+        if is_json:
+            return jsonify({"success": False, "error": err}), 400
+        flash(err, "error")
         return redirect(request.url)
 
     file = request.files["file"]
-    if file.filename == "":
+    if not file or file.filename == "":
+        err = "ไม่ได้เลือกไฟล์"
+        if is_json:
+            return jsonify({"success": False, "error": err}), 400
+        flash(err, "error")
         return redirect(request.url)
 
-    filename = secure_filename(file.filename)
-    os.makedirs("uploads", exist_ok=True)
-    file_path = os.path.join("uploads", filename)
+    if not is_allowed_file(file.filename):
+        err = f"นามสกุลไฟล์ไม่ถูกต้อง รองรับเฉพาะ: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        if is_json:
+            return jsonify({"success": False, "error": err}), 400
+        flash(err, "error")
+        return redirect(url_for("index"))
+
+    filename = safe_filename(file.filename)
+    if not filename:
+        err = "ชื่อไฟล์ไม่ถูกต้อง"
+        if is_json:
+            return jsonify({"success": False, "error": err}), 400
+        flash(err, "error")
+        return redirect(url_for("index"))
+
+    file_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(file_path)
+
+    # ตรวจสอบความถูกต้องของวิดีโอด้วย OpenCV
+    cap = cv2.VideoCapture(file_path)
+    if not cap.isOpened():
+        cap.release()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        err = "ไฟล์ที่อัปโหลดไม่สามารถเปิดเป็นวิดีโอที่ถูกต้องได้"
+        if is_json:
+            return jsonify({"success": False, "error": err}), 400
+        flash(err, "error")
+        return redirect(url_for("index"))
+    cap.release()
 
     # --- สร้างไฟล์ GT อัตโนมัติถ้ายังไม่มี หรือถ้าว่าง ให้เติมตัวอย่าง ---
     base = os.path.splitext(filename)[0]
-    gt_path = os.path.join("uploads", f"{base}_gt.txt")
-    example_path = os.path.join("uploads", f"{base}_gt_example.txt")
+    gt_path = os.path.join(UPLOAD_FOLDER, f"{base}_gt.txt")
+    example_path = os.path.join(UPLOAD_FOLDER, f"{base}_gt_example.txt")
     example_lines = [
         "# GT format per line: frame,x1,y1,x2,y2,label",
         "# ตัวอย่าง:",
         "15,100,50,420,300,accident",
     ]
 
-    # ถ้าไม่มีไฟล์ GT หรือตัวไฟล์ว่าง ให้เขียนตัวอย่างลงไปเพื่อไม่ให้เป็นไฟล์ว่าง
     try:
         if not os.path.exists(gt_path) or os.path.getsize(gt_path) == 0:
             with open(gt_path, "w", encoding="utf-8") as gf:
@@ -190,129 +324,143 @@ def upload_video():
     except Exception as _e:
         print(f"Failed creating GT file {gt_path}: {_e}")
 
-    # เก็บไฟล์ตัวอย่างอธิบายรูปแบบไว้ให้ผู้ใช้เปิดดูได้
     if not os.path.exists(example_path):
         try:
             with open(example_path, "w", encoding="utf-8") as ef:
                 ef.write("\n".join(example_lines) + "\n")
         except Exception as _e:
             print(f"Failed creating example GT file {example_path}: {_e}")
-    # --- จบการสร้างไฟล์ GT อัตโนมัติ ---
 
-    detected_objects_by_file[filename] = []
-    accident_log_by_file[filename] = []
+    with data_lock:
+        detected_objects_by_file[filename] = []
+        accident_log_by_file[filename] = []
+        all_detections_by_file[filename] = []
+        inference_stats_by_file[filename] = {"total_time": 0.0, "count": 0}
+
+    if is_json:
+        return jsonify({
+            "success": True,
+            "filename": filename,
+            "video_url": f"/video/{filename}",
+            "feed_url": f"/video_feed/{filename}",
+            "redirect_url": url_for("play_video", filename=filename),
+        })
+
     return redirect(url_for("play_video", filename=filename))
 
 
 @app.route("/upload_url", methods=["POST"])
 def upload_video_from_url():
-    """Upload video from URL"""
-    print("🔗 URL upload function called")
-    video_url = request.form.get("video_url", "").strip()
-    print(f"📥 Received URL: {video_url}")
-    
+    """Upload video from URL with SSRF protection and download capping"""
+    is_json = (
+        request.headers.get("Accept") == "application/json"
+        or request.is_json
+        or request.args.get("format") == "json"
+    )
+
+    req_data = request.get_json(silent=True) or request.form
+    video_url = req_data.get("video_url", "").strip()
+
     if not video_url:
-        print("❌ No URL provided")
-        flash("กรุณาป้อน URL วิดีโอ", "error")
+        err = "กรุณาป้อน URL วิดีโอ"
+        if is_json:
+            return jsonify({"success": False, "error": err}), 400
+        flash(err, "error")
         return redirect(url_for("index"))
-    
+
+    # SSRF Protection Check
+    is_safe, err_msg = is_safe_url(video_url)
+    if not is_safe:
+        if is_json:
+            return jsonify({"success": False, "error": err_msg}), 400
+        flash(err_msg, "error")
+        return redirect(url_for("index"))
+
     try:
-        # Validate URL (less strict)
-        parsed = urlparse(video_url)
-        if not parsed.scheme or not parsed.netloc:
-            print(f"❌ Invalid URL format: {video_url}")
-            flash("รูปแบบ URL ไม่ถูกต้อง กรุณาใส่ URL ที่ถูกต้อง", "error")
-            return redirect(url_for("index"))
-        
-        print(f"✅ URL validation passed: {parsed.scheme}://{parsed.netloc}")
-        
-        # Generate filename from URL
         url_hash = hashlib.md5(video_url.encode()).hexdigest()[:8]
         filename = f"url_{url_hash}.mp4"
-        
-        os.makedirs("uploads", exist_ok=True)
-        file_path = os.path.join("uploads", filename)
-        
-        # Download video from URL
-        print(f"Downloading video from: {video_url}")
-        response = requests.get(video_url, stream=True, timeout=30)
+        file_path = os.path.join(UPLOAD_FOLDER, filename)
+
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AccidentDetection/1.0"}
+        response = requests.get(video_url, stream=True, timeout=30, headers=headers)
         response.raise_for_status()
-        
-        # Check content type (less strict)
-        content_type = response.headers.get('content-type', '').lower()
-        has_video_content_type = 'video' in content_type or 'application/octet-stream' in content_type
-        has_video_extension = any(ext in video_url.lower() for ext in ['.mp4', '.avi', '.mov', '.mkv', '.webm', '.mp3', '.wav'])
-        
-        if not has_video_content_type and not has_video_extension:
-            flash("URL อาจไม่ชี้ไปยังไฟล์วิดีโอ (ลองตรวจสอบ URL อีกครั้ง)", "warning")
-            # Continue anyway, let OpenCV verify later
-        
-        # Download with progress
-        total_size = int(response.headers.get('content-length', 0))
+
+        # Check content-length header
+        content_length = response.headers.get("content-length")
+        if content_length and int(content_length) > MAX_DOWNLOAD_SIZE:
+            raise ValueError(f"ขนาดไฟล์ ({int(content_length)/(1024*1024):.1f} MB) เกินขีดจำกัดสูงสุด {MAX_DOWNLOAD_SIZE/(1024*1024)} MB")
+
         downloaded = 0
-        
-        with open(file_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
+        with open(file_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=16384):
                 if chunk:
-                    f.write(chunk)
                     downloaded += len(chunk)
-                    if total_size > 0:
-                        progress = (downloaded / total_size) * 100
-                        print(f"Download progress: {progress:.1f}%", end='\r')
-        
-        print(f"\nDownloaded {downloaded} bytes to {file_path}")
-        
-        # Verify the downloaded file is a valid video
+                    if downloaded > MAX_DOWNLOAD_SIZE:
+                        break
+                    f.write(chunk)
+
+        if downloaded > MAX_DOWNLOAD_SIZE:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            raise ValueError(f"ขนาดไฟล์ดาวน์โหลดเกินขีดจำกัดสูงสุด {MAX_DOWNLOAD_SIZE/(1024*1024)} MB")
+
+        # Verify video with OpenCV
         cap = cv2.VideoCapture(file_path)
         if not cap.isOpened():
             cap.release()
-            os.remove(file_path)
-            flash("ไฟล์ที่ดาวน์โหลดไม่ใช่วิดีโอที่ถูกต้อง", "error")
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            err = "ไฟล์ที่ดาวน์โหลดไม่ใช่วิดีโอที่ถูกต้อง"
+            if is_json:
+                return jsonify({"success": False, "error": err}), 400
+            flash(err, "error")
             return redirect(url_for("index"))
         cap.release()
-        
-        # --- สร้างไฟล์ GT อัตโนมัติ ---
+
+        # Create GT file
         base = os.path.splitext(filename)[0]
-        gt_path = os.path.join("uploads", f"{base}_gt.txt")
-        example_path = os.path.join("uploads", f"{base}_gt_example.txt")
+        gt_path = os.path.join(UPLOAD_FOLDER, f"{base}_gt.txt")
         example_lines = [
             "# GT format per line: frame,x1,y1,x2,y2,label",
             "# ตัวอย่าง:",
             "15,100,50,420,300,accident",
         ]
 
-        try:
-            if not os.path.exists(gt_path) or os.path.getsize(gt_path) == 0:
-                with open(gt_path, "w", encoding="utf-8") as gf:
-                    gf.write("\n".join(example_lines) + "\n")
-        except Exception as _e:
-            print(f"Failed creating GT file {gt_path}: {_e}")
+        if not os.path.exists(gt_path) or os.path.getsize(gt_path) == 0:
+            with open(gt_path, "w", encoding="utf-8") as gf:
+                gf.write("\n".join(example_lines) + "\n")
 
-        if not os.path.exists(example_path):
-            try:
-                with open(example_path, "w", encoding="utf-8") as ef:
-                    ef.write("\n".join(example_lines) + "\n")
-            except Exception as _e:
-                print(f"Failed creating example GT file {example_path}: {_e}")
-        
-        detected_objects_by_file[filename] = []
-        accident_log_by_file[filename] = []
-        
-        print(f"Video from URL ready for processing: {filename}")
+        with data_lock:
+            detected_objects_by_file[filename] = []
+            accident_log_by_file[filename] = []
+            all_detections_by_file[filename] = []
+            inference_stats_by_file[filename] = {"total_time": 0.0, "count": 0}
+
+        if is_json:
+            return jsonify({
+                "success": True,
+                "filename": filename,
+                "video_url": f"/video/{filename}",
+                "feed_url": f"/video_feed/{filename}",
+                "redirect_url": url_for("play_video", filename=filename),
+            })
+
         flash(f"ดาวน์โหลดวิดีโอจาก URL สำเร็จ: {filename}", "success")
         return redirect(url_for("play_video", filename=filename))
-        
-    except requests.exceptions.RequestException as e:
-        flash(f"เกิดข้อผิดพลาดในการดาวน์โหลดวิดีโอ: {str(e)}", "error")
-        return redirect(url_for("index"))
+
     except Exception as e:
-        flash(f"เกิดข้อผิดพลาดในการประมวลผล URL: {str(e)}", "error")
+        err = f"เกิดข้อผิดพลาดในการประมวลผล URL: {e!s}"
+        if is_json:
+            return jsonify({"success": False, "error": err}), 400
+        flash(err, "error")
         return redirect(url_for("index"))
 
 
 @app.route("/detected_objects/<filename>")
 def get_detected_objects(filename):
-    detected_objects = detected_objects_by_file.get(filename, [])
+    clean_name = safe_filename(filename)
+    with data_lock:
+        detected_objects = list(detected_objects_by_file.get(clean_name, []))
     return jsonify(detected_objects)
 
 
@@ -335,13 +483,13 @@ def iou(boxA, boxB):
 
 
 def load_gt_for_video(filename):
-    # support uploads/<filename>_gt.txt or uploads/<basename>_gt.txt or uploads/<basename>.gt
-    base = os.path.splitext(filename)[0]
+    clean_name = safe_filename(filename)
+    base = os.path.splitext(clean_name)[0]
     candidates = [
-        os.path.join("uploads", f"{base}_gt.txt"),
-        os.path.join("uploads", f"{base}_gt.csv"),
-        os.path.join("uploads", f"{base}.gt"),
-        os.path.join("uploads", f"{base}.txt"),
+        os.path.join(UPLOAD_FOLDER, f"{base}_gt.txt"),
+        os.path.join(UPLOAD_FOLDER, f"{base}_gt.csv"),
+        os.path.join(UPLOAD_FOLDER, f"{base}.gt"),
+        os.path.join(UPLOAD_FOLDER, f"{base}.txt"),
     ]
     for p in candidates:
         if os.path.exists(p):
@@ -349,31 +497,22 @@ def load_gt_for_video(filename):
             with open(p, "r", encoding="utf-8") as f:
                 reader = csv.reader(f)
                 for row in reader:
-                    # skip empty rows and comment lines
                     if not row:
                         continue
-                    # join then strip to allow CSV parsers that split commented lines
                     line = ",".join(row).strip()
                     if not line or line.startswith("#"):
                         continue
                     parts = [s.strip() for s in line.split(",")]
-                    # expect: frame,x1,y1,x2,y2,label
                     if len(parts) < 5:
                         continue
-                    # first field must be integer frame index
                     try:
                         frame = int(parts[0])
-                    except Exception:
-                        continue
-                    try:
                         x1, y1, x2, y2 = map(int, parts[1:5])
                     except Exception:
                         continue
                     label = parts[5].strip() if len(parts) > 5 else "accident"
-                    # apply remap like detections (case-insensitive)
                     label = LABEL_REMAP.get(label, LABEL_REMAP.get(label.lower(), label))
                     gt.append({"frame": frame, "box": [x1, y1, x2, y2], "label": label})
-            # if no valid GT entries found, treat as not found
             return gt if gt else None
     return None
 # --- เพิ่มฟังก์ชันคำนวณ AP (สำหรับคลาสเดียว เช่น "accident") ---
@@ -449,8 +588,7 @@ def compute_ap(preds, gts, iou_thr=0.5, class_name=ACCIDENT_CLASS_NAME):
     mrec = [0.0] + recalls + [1.0]
     mpre = [0.0] + precisions + [0.0]
     for i in range(len(mpre) - 2, -1, -1):
-        if mpre[i] < mpre[i + 1]:
-            mpre[i] = mpre[i + 1]
+        mpre[i] = max(mpre[i], mpre[i + 1])
     ap = 0.0
     for i in range(1, len(mrec)):
         if mrec[i] != mrec[i - 1]:
@@ -465,13 +603,16 @@ def evaluate(filename):
     and inference time (average ms per frame).
     Accept optional ?iou= to control IoU threshold used for AP and display.
     """
+    clean_name = safe_filename(filename)
     try:
         iou_thr = float(request.args.get("iou", 0.5))
     except Exception:
         iou_thr = 0.5
 
-    gts = load_gt_for_video(filename) or []
-    preds = all_detections_by_file.get(filename, []) or []
+    gts = load_gt_for_video(clean_name) or []
+    with data_lock:
+        preds = list(all_detections_by_file.get(clean_name, []) or [])
+        stats = dict(inference_stats_by_file.get(clean_name, {"total_time": 0.0, "count": 0}))
 
     # existing color-count style metrics (kept for backward compatibility)
     total_gt = sum(1 for _ in gts) if gts is not None else 0
@@ -515,7 +656,7 @@ def evaluate(filename):
     mAP = ap  # only one class here
 
     # --- inference time stats ---
-    stats = inference_stats_by_file.get(filename, {"total_time": 0.0, "count": 0})
+    stats = inference_stats_by_file.get(clean_name, {"total_time": 0.0, "count": 0})
     avg_inference_ms = (stats["total_time"] / stats["count"] * 1000.0) if stats["count"] > 0 else None
 
     metrics = {
@@ -548,6 +689,10 @@ def detect_objects_from_video(video_path, filename):
     # ensure stats entry
     inference_stats_by_file.setdefault(filename, {"total_time": 0.0, "count": 0})
 
+    # --- INTELLIGENT FILTER STATE ---
+    accident_streak = 0
+    last_logged_accident_time = -999.0
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -560,21 +705,19 @@ def detect_objects_from_video(video_path, filename):
 
         # resize for inference / display
         frame = cv2.resize(frame, (1020, 600))
-        
-        # Apply CLAHE enhancement for better contrast
-        frame_enhanced = apply_clahe(frame)
+
+        # Apply Adaptive Lighting Enhancement (Handles night / bright glare automatically)
+        frame_enhanced = apply_adaptive_enhancement(frame)
 
         # initialize per-frame variables
-        frame_has_detection = False
         class_ids = []
         boxes = []
         confidences = []
         track_ids = []
         detected_objects = []
-        found_accident_this_frame = None  # Store accident info for this frame
+        raw_accident_candidate = None
 
         try:
-            # run tracker/detector (adjust conf/iou when tuning) - use enhanced frame
             t0 = time.time()
             results = model.track(frame_enhanced, persist=True, conf=TRACK_CONF, iou=TRACK_IOU)
             t1 = time.time()
@@ -582,237 +725,280 @@ def detect_objects_from_video(video_path, filename):
             inference_stats_by_file[filename]["total_time"] += (t1 - t0)
             inference_stats_by_file[filename]["count"] += 1
 
-            if not results or results[0].boxes is None:
-                print(f"[frame {count}] no detections")
-            else:
+            if results and results[0].boxes is not None:
                 boxes_obj = results[0].boxes
+                boxes = to_list_safe(getattr(boxes_obj, "xyxy", None), to_int=True)
+                class_ids = to_list_safe(getattr(boxes_obj, "cls", None), to_int=True)
+                confidences = to_list_safe(getattr(boxes_obj, "conf", None), to_int=False)
+                track_ids_list = to_list_safe(getattr(boxes_obj, "id", None), to_int=True)
+                track_ids = track_ids_list if track_ids_list else [None] * len(class_ids)
 
-                # safe attribute extraction
-                boxes = (
-                    boxes_obj.xyxy.int().cpu().tolist()
-                    if getattr(boxes_obj, "xyxy", None) is not None
-                    else []
-                )
-                class_ids = (
-                    boxes_obj.cls.int().cpu().tolist()
-                    if getattr(boxes_obj, "cls", None) is not None
-                    else []
-                )
-                confidences = (
-                    boxes_obj.conf.cpu().tolist()
-                    if getattr(boxes_obj, "conf", None) is not None
-                    else []
-                )
-                track_ids = (
-                    boxes_obj.id.int().cpu().tolist()
-                    if getattr(boxes_obj, "id", None) is not None
-                    else [None] * len(class_ids)
-                )
-
-                # Parse detections
-                debug_list = []
-                for i, cid in enumerate(class_ids):
-                    conf = confidences[i] if i < len(confidences) else 0.0
-                    label = names[cid] if isinstance(names, (list, dict)) else str(cid)
-                    debug_list.append((label, float(conf)))
-                print(f"[frame {count}] detections:", debug_list)
-
-                # draw all boxes (accident red, others green) and save crops + frame
+                # Process all detected boxes
                 for i in range(len(class_ids)):
                     box = boxes[i] if i < len(boxes) else [0, 0, 0, 0]
                     class_id = class_ids[i]
                     track_id = track_ids[i] if i < len(track_ids) else None
                     conf = confidences[i] if i < len(confidences) else 0.0
 
-                    # Get raw label and apply remapping
                     label_raw = names[class_id] if isinstance(names, (list, dict)) else str(class_id)
                     label = LABEL_REMAP.get(label_raw, LABEL_REMAP.get(label_raw.lower(), label_raw))
 
                     x1, y1, x2, y2 = map(int, box)
-                    is_accident_high_conf = (label.lower() == ACCIDENT_CLASS_NAME.lower() and conf >= ACCIDENT_CONF_THRESHOLD)
-                    is_accident_low_conf = (label.lower() == ACCIDENT_CLASS_NAME.lower() and conf < ACCIDENT_CONF_THRESHOLD)
-                    is_vehicle_class = label.lower() in [v.lower() for v in TARGET_VEHICLE_CLASSES]
-                    
-                    # Skip drawing for:
-                    # 1. Low-confidence accidents
-                    if is_accident_low_conf:
-                        continue
-                    
-                    # Show all other detections as green boxes (including non-vehicle classes)
-                    if is_accident_high_conf:
-                        color = (0, 0, 255)  # Red for high-confidence accidents
-                    elif is_vehicle_class:
-                        color = (255, 0, 0)  # Blue for vehicle classes
-                    else:
-                        color = (0, 255, 0)  # Green for other classes
-
-                    # draw rectangle and text (accident high-conf or vehicle classes)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(
-                        frame,
-                        f"{track_id} - {label} ({conf:.2f})",
-                        (x1, max(15, y1 - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        1,
+                    is_accident_cand = (
+                        label.lower() == ACCIDENT_CLASS_NAME.lower()
+                        and conf >= ACCIDENT_CONF_THRESHOLD
                     )
+                    is_vehicle = label.lower() in [v.lower() for v in TARGET_VEHICLE_CLASSES]
 
-                    frame_has_detection = True
-
-                    # record detected object label
-                    detected_objects.append(label)
-
-                    # เก็บทุกรายการ detection เพื่อใช้ในการ evaluate แบบสี
-                    detections.append({
-                        "frame": count,
-                        "box": [x1, y1, x2, y2],
-                        "confidence": conf,
-                        "label": label,
-                        "is_accident": bool(is_accident_high_conf)
-                    })
-
-                    # if it's a confident accident, save full-frame (with drawn boxes) and log it
-                    if is_accident_high_conf:
-                        frame_filename = f"{filename}_frame_{count}.jpg"
-                        frame_path = os.path.join(ACCIDENT_FRAME_DIR, frame_filename)
-                        try:
-                            cv2.imwrite(frame_path, frame)  # saved AFTER drawing boxes
-                        except Exception as _e:
-                            print(f"Failed to write accident frame {frame_path}: {_e}")
-
-                        sec = int(count / fps) if fps else count
-                        if not accident_log or accident_log[-1].get("frame") != count:
-                            accident_log.append(
-                                {
-                                    "frame": count,
-                                    "time": sec,
-                                    "box": [x1, y1, x2, y2],
-                                    "confidence": conf,
-                                    "img": frame_filename,
-                                    "label": label,
-                                    "vehicle_counts": {}  # Will be filled after vehicle detection
-                                }
-                            )
-                            print("RED ACCIDENT LOGGED:", frame_filename, conf)
-                            # Store accident info for this frame for vehicle detection
-                            found_accident_this_frame = {
+                    if is_accident_cand:
+                        if (
+                            raw_accident_candidate is None
+                            or conf > raw_accident_candidate["conf"]
+                        ):
+                            raw_accident_candidate = {
                                 "box": [x1, y1, x2, y2],
                                 "conf": conf,
                                 "label": label,
-                                "log_index": len(accident_log) - 1  # Index to update with vehicle counts
+                                "track_id": track_id,
                             }
+                    elif is_vehicle:
+                        color = (255, 0, 0)  # Blue for vehicles
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(
+                            frame,
+                            f"{label} ({conf:.2f})",
+                            (x1, max(15, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45,
+                            color,
+                            1,
+                        )
+                        detected_objects.append(label)
+                        detections.append({
+                            "frame": count,
+                            "box": [x1, y1, x2, y2],
+                            "confidence": conf,
+                            "label": label,
+                            "is_accident": False,
+                        })
+                    else:
+                        color = (0, 255, 0)  # Green for other objects
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(
+                            frame,
+                            f"{label} ({conf:.2f})",
+                            (x1, max(15, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45,
+                            color,
+                            1,
+                        )
+                        detected_objects.append(label)
 
-            # --- overlay summary (total boxes & per-class counts) and save full-frame detection ---
-            total_boxes = len(class_ids)
-            class_labels = [names[cid] if isinstance(names, (list, dict)) else str(cid) for cid in class_ids]
-            counts = Counter(class_labels)
-
-            # Initialize vehicle counts
+            # --- VEHICLE CROSS-VALIDATION & ROI REFINEMENT ---
             vehicle_counts = {}
+            is_spatial_verified = False
 
-            # --- If accident found, detect vehicles in accident ROI ---
-            if found_accident_this_frame and vehicle_model:
-                x1, y1, x2, y2 = found_accident_this_frame["box"]
-                roi_frame = frame_enhanced[y1:y2, x1:x2]  # Use enhanced frame
-
-                if roi_frame.size > 0:
-                    try:
-                        results_veh = vehicle_model.predict(roi_frame, verbose=False, conf=VEHICLE_DETECTION_CONF)
-                        for res_v in results_veh:
-                            boxes_v = res_v.boxes
-                            for box_v in boxes_v:
-                                v_cls_id = int(box_v.cls[0])
-                                v_cls_name = vehicle_model.names[v_cls_id] if isinstance(vehicle_model.names, (list, dict)) else str(v_cls_id)
-
-                                if v_cls_name.lower() in [v.lower() for v in TARGET_VEHICLE_CLASSES]:
-                                    vx1_local, vy1_local, vx2_local, vy2_local = map(int, box_v.xyxy[0])
-
-                                    if v_cls_name in vehicle_counts:
-                                        vehicle_counts[v_cls_name] += 1
-                                    else:
-                                        vehicle_counts[v_cls_name] = 1
-
-                                    vx1 = vx1_local + x1
-                                    vy1 = vy1_local + y1
-                                    vx2 = vx2_local + x1
-                                    vy2 = vy2_local + y1
-
-                                    # Draw vehicle box on frame (green)
-                                    cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), (0, 255, 0), 2)
-                                    cv2.putText(frame, v_cls_name, (vx1, vy1 - 5),
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-                        print(f"   -> Vehicle summary: {vehicle_counts}")
-                        
-                        # Update accident log with vehicle counts
-                        if "log_index" in found_accident_this_frame:
-                            log_idx = found_accident_this_frame["log_index"]
-                            if 0 <= log_idx < len(accident_log):
-                                accident_log[log_idx]["vehicle_counts"] = vehicle_counts
-                    except Exception as e:
-                        print(f"   -> Error detecting vehicles: {e}")
-            
-            # --- Optional: Full-frame vehicle detection (disabled by default for performance) ---
-            # Uncomment to enable, but will add latency
-            # if DETECT_VEHICLES_FULL_FRAME and vehicle_model:
-            #     try:
-            #         results_full = vehicle_model.predict(frame_enhanced, verbose=False, conf=0.5)
-            #         for res_f in results_full:
-            #             boxes_f = res_f.boxes
-            #             for box_f in boxes_f:
-            #                 f_cls_id = int(box_f.cls[0])
-            #                 f_cls_name = vehicle_model.names[f_cls_id] if isinstance(vehicle_model.names, (list, dict)) else str(f_cls_id)
-            #                 if f_cls_name.lower() in [v.lower() for v in TARGET_VEHICLE_CLASSES]:
-            #                     fx1, fy1, fx2, fy2 = map(int, box_f.xyxy[0])
-            #                     is_in_accident_area = False
-            #                     if found_accident_this_frame:
-            #                         ax1, ay1, ax2, ay2 = found_accident_this_frame["box"]
-            #                         if not (fx2 < ax1 or fx1 > ax2 or fy2 < ay1 or fy1 > ay2):
-            #                             is_in_accident_area = True
-            #                     if not is_in_accident_area:
-            #                         cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 0, 0), 2)
-            #                         cv2.putText(frame, f"{f_cls_name}", (fx1, fy1 - 5),
-            #                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-            #     except Exception as e:
-            #         pass
-            
-            # --- Send Telegram alert in background (non-blocking) ---
-            if found_accident_this_frame:
-                import threading
-                alert_thread = threading.Thread(
-                    target=send_telegram_alert_async,
-                    args=(frame, found_accident_this_frame["label"], 
-                          found_accident_this_frame["conf"] * 100, vehicle_counts, filename),
-                    daemon=True
+            if raw_accident_candidate:
+                ax1, ay1, ax2, ay2 = raw_accident_candidate["box"]
+                h_b, w_b = ay2 - ay1, ax2 - ax1
+                pad_x, pad_y = int(w_b * 0.15), int(h_b * 0.15)
+                rx1, ry1 = max(0, ax1 - pad_x), max(0, ay1 - pad_y)
+                rx2, ry2 = min(frame_enhanced.shape[1], ax2 + pad_x), min(
+                    frame_enhanced.shape[0], ay2 + pad_y
                 )
-                alert_thread.start()
 
-            overlay_text = f"Detections: {total_boxes}"
-            cv2.putText(frame, overlay_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
+                if vehicle_model:
+                    roi_frame = frame_enhanced[ry1:ry2, rx1:rx2]
+                    if roi_frame.size > 0:
+                        try:
+                            results_veh = vehicle_model.predict(
+                                roi_frame, verbose=False, conf=VEHICLE_DETECTION_CONF
+                            )
+                            veh_names = getattr(vehicle_model, "names", {})
+                            for res_v in results_veh:
+                                if res_v.boxes is not None:
+                                    for box_v in res_v.boxes:
+                                        cls_data = getattr(box_v, "cls", None)
+                                        if cls_data is None or len(cls_data) == 0:
+                                            continue
+                                        v_cls_id = int(cls_data[0])
+                                        v_cls_name = (
+                                            veh_names.get(v_cls_id, str(v_cls_id))
+                                            if isinstance(veh_names, dict)
+                                            else (
+                                                veh_names[v_cls_id]
+                                                if isinstance(veh_names, list) and v_cls_id < len(veh_names)
+                                                else str(v_cls_id)
+                                            )
+                                        )
+                                        if v_cls_name.lower() in [
+                                            v.lower() for v in TARGET_VEHICLE_CLASSES
+                                        ]:
+                                            vehicle_counts[v_cls_name] = (
+                                                vehicle_counts.get(v_cls_name, 0) + 1
+                                            )
+                                            xyxy_data = getattr(box_v, "xyxy", None)
+                                            if xyxy_data is None or len(xyxy_data) == 0:
+                                                continue
+                                            vx1_loc, vy1_loc, vx2_loc, vy2_loc = map(
+                                                int, xyxy_data[0]
+                                            )
+                                            vx1, vy1 = vx1_loc + rx1, vy1_loc + ry1
+                                            vx2, vy2 = vx2_loc + rx1, vy2_loc + ry1
+                                            # Highlight vehicles in accident area (Bright Green)
+                                            cv2.rectangle(
+                                                frame, (vx1, vy1), (vx2, vy2), (0, 255, 0), 2
+                                            )
+                                            cv2.putText(
+                                                frame,
+                                                f"{v_cls_name}",
+                                                (vx1, max(15, vy1 - 5)),
+                                                cv2.FONT_HERSHEY_SIMPLEX,
+                                                0.45,
+                                                (0, 255, 0),
+                                                1,
+                                            )
 
-            y = 45
-            for lbl, cnt in counts.items():
-                line = f"{lbl}: {cnt}"
-                cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
-                y += 20
+                            total_roi_vehs = sum(vehicle_counts.values())
+                            # Spatial logic: collision of 2+ vehicles, or single vehicle with high conf, or very high confidence
+                            if total_roi_vehs >= 2 or total_roi_vehs == 1 and raw_accident_candidate["conf"] >= 0.72 or raw_accident_candidate["conf"] >= CONFIRMED_HIGH_CONF:
+                                is_spatial_verified = True
+                            else:
+                                is_spatial_verified = False
+                        except Exception:
+                            is_spatial_verified = True
+                else:
+                    is_spatial_verified = True
 
-            # save full-frame detection image only when accident is detected
-            if found_accident_this_frame:
-                det_frame_filename = f"{filename}_detframe_{count}.jpg"
-                det_frame_path = os.path.join(DETECTION_FRAME_DIR, det_frame_filename)
-                try:
-                    cv2.imwrite(det_frame_path, frame)
-                except Exception as _e:
-                    print(f"Failed to write detection frame {det_frame_path}: {_e}")
+            # --- TEMPORAL PERSISTENCE FILTER (Filters single-frame flickers) ---
+            if raw_accident_candidate and is_spatial_verified:
+                accident_streak += 1
+            else:
+                accident_streak = max(0, accident_streak - 1)
+
+            is_confirmed_accident = accident_streak >= MIN_ACCIDENT_STREAK
+
+            # --- VISUAL FEEDBACK & OVERLAY ---
+            if raw_accident_candidate:
+                ax1, ay1, ax2, ay2 = raw_accident_candidate["box"]
+                a_conf = raw_accident_candidate["conf"]
+                detected_objects.append("accident")
+
+                if is_confirmed_accident:
+                    # CONFIRMED: Prominent Red Box with Badge
+                    cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), (0, 0, 255), 3)
+                    label_text = f"🚨 ACCIDENT CONFIRMED ({a_conf * 100:.1f}%)"
+                    (tw, _), _ = cv2.getTextSize(
+                        label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+                    )
+                    cv2.rectangle(
+                        frame, (ax1, max(0, ay1 - 25)), (ax1 + tw + 10, ay1), (0, 0, 255), -1
+                    )
+                    cv2.putText(
+                        frame,
+                        label_text,
+                        (ax1 + 5, max(15, ay1 - 7)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                    )
+
+                    detections.append({
+                        "frame": count,
+                        "box": raw_accident_candidate["box"],
+                        "confidence": a_conf,
+                        "label": ACCIDENT_CLASS_NAME,
+                        "is_accident": True,
+                    })
+
+                    # --- LOGGING WITH INCIDENT COOLDOWN (Eliminates spam) ---
+                    sec = int(count / fps) if fps else count
+                    time_since_last_alert = sec - last_logged_accident_time
+                    if time_since_last_alert >= ACCIDENT_COOLDOWN_SEC:
+                        last_logged_accident_time = sec
+                        frame_filename = f"{filename}_frame_{count}.jpg"
+                        frame_path = os.path.join(ACCIDENT_FRAME_DIR, frame_filename)
+                        try:
+                            cv2.imwrite(frame_path, frame)
+                        except Exception as _e:
+                            pass
+
+                        det_frame_filename = f"{filename}_detframe_{count}.jpg"
+                        det_frame_path = os.path.join(
+                            DETECTION_FRAME_DIR, det_frame_filename
+                        )
+                        try:
+                            cv2.imwrite(det_frame_path, frame)
+                        except Exception as _e:
+                            pass
+
+                        accident_log.append({
+                            "frame": count,
+                            "time": sec,
+                            "box": raw_accident_candidate["box"],
+                            "confidence": a_conf,
+                            "img": frame_filename,
+                            "label": raw_accident_candidate["label"],
+                            "vehicle_counts": vehicle_counts,
+                        })
+                        print(
+                            f"🚨 [CONFIRMED ACCIDENT] Frame {count} ({sec}s) | Conf: {a_conf:.2f} | Vehicles: {vehicle_counts}"
+                        )
+
+                        if ENABLE_TELEGRAM:
+                            alert_thread = threading.Thread(
+                                target=send_telegram_alert_async,
+                                args=(
+                                    frame,
+                                    raw_accident_candidate["label"],
+                                    a_conf * 100,
+                                    vehicle_counts,
+                                    filename,
+                                ),
+                                daemon=True,
+                            )
+                            alert_thread.start()
+
+                elif accident_streak == 1:
+                    # CANDIDATE (PENDING CONFIRMATION): Amber box (no spam, no log yet)
+                    cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), (0, 165, 255), 2)
+                    label_text = f"Analyzing... ({a_conf * 100:.1f}%)"
+                    cv2.putText(
+                        frame,
+                        label_text,
+                        (ax1, max(15, ay1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 165, 255),
+                        1,
+                    )
+
+            # Overlay stats HUD on frame
+            status_text = (
+                f"Status: {'CRITICAL (ACCIDENT)' if is_confirmed_accident else 'MONITORING'} | Streak: {accident_streak}"
+            )
+            status_color = (0, 0, 255) if is_confirmed_accident else (0, 255, 0)
+            cv2.putText(
+                frame,
+                status_text,
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                status_color,
+                2,
+                cv2.LINE_AA,
+            )
 
         except Exception as e:
             print(f"Exception processing frame {count}:", e)
 
-        # update shared state for frontend
-        detected_objects_by_file[filename] = detected_objects
-        accident_log_by_file[filename] = accident_log
-        all_detections_by_file[filename] = detections
+        # update shared state for frontend (thread-safe)
+        with data_lock:
+            detected_objects_by_file[filename] = detected_objects
+            accident_log_by_file[filename] = accident_log
+            all_detections_by_file[filename] = detections
 
         # encode frame for MJPEG stream (frame with boxes)
         _, buffer = cv2.imencode(".jpg", frame)
@@ -828,65 +1014,127 @@ def detect_objects_from_video(video_path, filename):
 
 @app.route("/video_feed/<filename>")
 def video_feed(filename):
-    video_path = os.path.join("uploads", filename)
-    return Response(detect_objects_from_video(video_path, filename), mimetype="multipart/x-mixed-replace; boundary=frame")
+    clean_name = safe_filename(filename)
+    if not clean_name:
+        return "Invalid filename", 400
+    video_path = os.path.join(UPLOAD_FOLDER, clean_name)
+    if not os.path.exists(video_path):
+        return "Video not found", 404
+    return Response(
+        detect_objects_from_video(video_path, clean_name),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
 
 
 @app.route("/uploads/<filename>")
 def play_video(filename):
-    detected_objects = detected_objects_by_file.get(filename, [])
-    return render_template("play_video.html", filename=filename, detected_objects=detected_objects)
+    clean_name = safe_filename(filename)
+    with data_lock:
+        detected_objects = list(detected_objects_by_file.get(clean_name, []))
+    return render_template("play_video.html", filename=clean_name, detected_objects=detected_objects)
 
 
 @app.route("/video/<path:filename>")
 def send_video(filename):
-    return send_from_directory("uploads", filename)
+    clean_name = safe_filename(filename)
+    if not clean_name:
+        return "Invalid filename", 400
+    return send_from_directory(UPLOAD_FOLDER, clean_name)
 
 
 @app.route("/accident_log/<filename>")
 def accident_log(filename):
-    log = accident_log_by_file.get(filename, [])
+    clean_name = safe_filename(filename)
+    with data_lock:
+        log = list(accident_log_by_file.get(clean_name, []))
     return jsonify(log)
 
+
+@app.route("/accident_frame/<filename>")
+def get_accident_frame(filename):
+    clean_name = safe_filename(filename)
+    if not clean_name:
+        return "", 404
+    return send_from_directory(ACCIDENT_FRAME_DIR, clean_name)
 
 
 @app.route("/detection_frames/<filename>")
 def get_detection_frames(filename):
     """Return list of all detection frame numbers for a video"""
+    clean_name = safe_filename(filename)
     frames = []
-    if filename in all_detections_by_file:
-        # Get unique frame numbers from detections
-        frame_nums = set()
-        for detection in all_detections_by_file[filename]:
-            frame_nums.add(detection['frame'])
-        frames = sorted(list(frame_nums))
-    
-    # If no detections, try to find saved detection frames
+    with data_lock:
+        if clean_name in all_detections_by_file:
+            frame_nums = set()
+            for detection in all_detections_by_file[clean_name]:
+                frame_nums.add(detection["frame"])
+            frames = sorted(frame_nums)
+
+    # If no detections in memory, check saved detection frames
     if not frames:
-        pattern = os.path.join(DETECTION_FRAME_DIR, f"{filename}_detframe_*.jpg")
+        pattern = os.path.join(DETECTION_FRAME_DIR, f"{clean_name}_detframe_*.jpg")
         frame_files = glob.glob(pattern)
         frames = []
         for f in frame_files:
             basename = os.path.basename(f)
-            # Extract frame number from filename like "video_detframe_123.jpg"
             try:
-                frame_num = int(basename.split('_detframe_')[1].split('.')[0])
+                frame_num = int(basename.split("_detframe_")[1].split(".")[0])
                 frames.append(frame_num)
-            except:
+            except Exception:
                 continue
-        frames = sorted(list(set(frames)))
-    
+        frames = sorted(set(frames))
+
     return jsonify(frames)
 
 
 @app.route("/detection_frame/<filename>")
 def detection_frame(filename):
-    frame_num = int(request.args.get("frame", 0))
-    detection_frame_filename = f"{filename}_detframe_{frame_num}.jpg"
-    frame_path = os.path.join(DETECTION_FRAME_DIR, detection_frame_filename)
-    if not os.path.exists(frame_path):
+    clean_name = safe_filename(filename)
+    if not clean_name:
         return "", 404
-    return send_file(frame_path, mimetype="image/jpeg")
+    try:
+        frame_num = int(request.args.get("frame", 0))
+    except (ValueError, TypeError):
+        return "", 400
+    detection_frame_filename = f"{clean_name}_detframe_{frame_num}.jpg"
+    return send_from_directory(DETECTION_FRAME_DIR, detection_frame_filename)
+
+
+@app.route("/api/videos", methods=["GET"])
+def list_videos():
+    """List available uploaded videos for the dashboard"""
+    videos = []
+    if os.path.exists(UPLOAD_FOLDER):
+        for f in os.listdir(UPLOAD_FOLDER):
+            f_path = os.path.join(UPLOAD_FOLDER, f)
+            if os.path.isfile(f_path) and is_allowed_file(f):
+                stat = os.stat(f_path)
+                videos.append({
+                    "filename": f,
+                    "size_mb": round(stat.st_size / (1024 * 1024), 2),
+                    "created_at": datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                })
+    videos.sort(key=lambda x: x["created_at"], reverse=True)
+    return jsonify({"success": True, "videos": videos})
+
+
+@app.route("/api/status", methods=["GET"])
+def get_system_status():
+    """System health and AI configuration endpoint"""
+    return jsonify({
+        "status": "online",
+        "models": {
+            "accident_model": model is not None,
+            "vehicle_model": vehicle_model is not None,
+        },
+        "config": {
+            "enable_telegram": ENABLE_TELEGRAM,
+            "accident_conf_threshold": ACCIDENT_CONF_THRESHOLD,
+            "track_conf": TRACK_CONF,
+            "process_every_n": PROCESS_EVERY_N,
+            "clahe_enabled": True
+        }
+    })
 
 
 if __name__ == "__main__":
